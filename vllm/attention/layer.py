@@ -355,6 +355,20 @@ class Attention(nn.Module, AttentionLayerBase):
         ):
             self.query_quant = QuantFP8(static=True, group_shape=GroupShape.PER_TENSOR)
 
+        # KV Cache Compression
+        self.kv_compressor: Optional[KVCacheCompressor] = None
+        if cache_config is not None and cache_config.enable_kv_compression:
+            compression_config = KVCompressionConfig(
+                strategy=CompressionStrategy(cache_config.kv_compression_strategy),
+                max_tokens_before_compression=cache_config.kv_compression_max_tokens,
+                compression_ratio=cache_config.kv_compression_ratio,
+            )
+            self.kv_compressor = KVCacheCompressor(compression_config)
+            logger.info(
+                f"KV compression enabled for layer {prefix}: "
+                f"strategy={cache_config.kv_compression_strategy}"
+            )
+
     def forward(
         self,
         query: torch.Tensor,
