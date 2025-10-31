@@ -75,6 +75,12 @@ def parse_args():
         help="MM processor cache size in GB (0 to disable)",
     )
     parser.add_argument(
+        "--max-model-len",
+        type=int,
+        default=16384,
+        help="Set vLLM max_model_len to accommodate text + video tokens",
+    )
+    parser.add_argument(
         "--save-fig",
         type=str,
         default=None,
@@ -165,6 +171,7 @@ def run_once(
     fps: float,
     max_tokens: int,
     mm_cache_gb: float,
+    max_model_len: int,
 ) -> RunStats:
     engine_args, inputs = build_input_for_qwen_video(model_name, num_frames, fps)
 
@@ -172,6 +179,12 @@ def run_once(
     engine_args.limit_mm_per_prompt = {"video": 1}
     # Enable/disable MM processor cache
     engine_args.mm_processor_cache_gb = max(0.0, mm_cache_gb)
+    # Ensure context window can fit text + multimodal tokens
+    try:
+        current = getattr(engine_args, "max_model_len", None) or 0
+        engine_args.max_model_len = max(current, int(max_model_len))
+    except Exception:
+        engine_args.max_model_len = int(max_model_len)
 
     llm = LLM(**engine_args.__dict__)
     sampling_params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
@@ -258,6 +271,7 @@ def main():
         fps=args.fps,
         max_tokens=args.max_tokens,
         mm_cache_gb=args.mm_cache_gb,
+        max_model_len=args.max_model_len,
     )
 
     print("-" * 60)
