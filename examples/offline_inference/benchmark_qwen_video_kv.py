@@ -16,6 +16,7 @@ Examples:
 
 import argparse
 import time
+import threading
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -43,10 +44,15 @@ class RunStats:
     decode_time: float
     ttft: float
     kv_usage_perc: float
+    peak_kv_usage_perc: float
+    peak_kv_usage_perc_decode: float
     prompt_tokens: int
     generation_tokens: int
     cache_block_size: Optional[int]
     cache_num_gpu_blocks: Optional[int]
+    kv_usage_samples: List[Tuple[float, float]]  # (t_rel_sec, usage_frac)
+    fps: float
+    num_frames: int
 
 
 def parse_args():
@@ -138,6 +144,22 @@ def extract_cache_config_info(metrics: List[Metric]) -> Tuple[Optional[int], Opt
     return (None, None)
 
 
+def get_latest_kv_usage(metrics: List[Metric]) -> Optional[float]:
+    return get_latest_gauge_value(metrics, "vllm:kv_cache_usage_perc")
+
+
+def monitor_kv_usage(llm: LLM, start_time: float, stop_event: threading.Event, samples: List[Tuple[float, float]], interval_s: float = 0.1) -> None:
+    while not stop_event.is_set():
+        try:
+            ms = llm.get_metrics()
+            val = get_latest_kv_usage(ms)
+            if val is not None:
+                samples.append((time.time() - start_time, float(val)))
+        except Exception:
+            pass
+        time.sleep(interval_s)
+
+
 def build_input_for_qwen_video(model_name: str, num_frames: int, fps: float):
     # Build EngineArgs + prompts via run_qwen3_vl
     req_data = run_qwen3_vl(["Describe this video."], "video")
@@ -193,11 +215,20 @@ def run_once(
     pre_metrics = llm.get_metrics()
 
     t0 = time.time()
+    # Start background KV usage sampler
+    samples: List[Tuple[float, float]] = []
+    stop_evt = threading.Event()
+    sampler_thread = threading.Thread(target=monitor_kv_usage, args=(llm, t0, stop_evt, samples), daemon=True)
+    sampler_thread.start()
+
     outputs = llm.generate([inputs], sampling_params=sampling_params)
     e2e_time = time.time() - t0
 
     # Snapshot metrics AFTER
     post_metrics = llm.get_metrics()
+    # Stop sampler
+    stop_evt.set()
+    sampler_thread.join(timeout=1.0)
 
     # Extract latency components from histograms (delta for this request)
     ttft = get_hist_value_delta(pre_metrics, post_metrics, "vllm:time_to_first_token_seconds")
@@ -205,7 +236,11 @@ def run_once(
     decode_time = get_hist_value_delta(pre_metrics, post_metrics, "vllm:request_decode_time_seconds")
 
     # KV cache usage percentage (engine-level gauge, last recorded)
-    kv_usage_perc = get_latest_gauge_value(post_metrics, "vllm:kv_cache_usage_perc") or 0.0
+    kv_usage_perc = get_latest_kv_usage(post_metrics) or 0.0
+    peak_kv_usage_perc = max([v for _, v in samples], default=kv_usage_perc)
+    # Peak during decode only
+    decode_only_vals = [v for t, v in samples if t > prefill_time]
+    peak_kv_usage_perc_decode = max(decode_only_vals) if decode_only_vals else peak_kv_usage_perc
 
     # Counters deltas
     prompt_tokens = get_counter_delta(pre_metrics, post_metrics, "vllm:prompt_tokens")
@@ -222,15 +257,20 @@ def run_once(
         decode_time=decode_time,
         ttft=ttft,
         kv_usage_perc=kv_usage_perc,
+        peak_kv_usage_perc=peak_kv_usage_perc,
+        peak_kv_usage_perc_decode=peak_kv_usage_perc_decode,
         prompt_tokens=prompt_tokens,
         generation_tokens=generation_tokens,
         cache_block_size=block_size,
         cache_num_gpu_blocks=num_gpu_blocks,
+        kv_usage_samples=samples,
+        fps=fps,
+        num_frames=num_frames,
     )
 
 
 def plot_results(stats: RunStats, save_path: Optional[str] = None) -> None:
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+    fig, axes = plt.subplots(1, 4, figsize=(18, 4))
 
     # Latency breakdown
     axes[0].bar(["TTFT", "Prefill", "Decode", "E2E"], [stats.ttft, stats.prefill_time, stats.decode_time, stats.e2e_time], color=["#4C78A8", "#F58518", "#54A24B", "#B279A2"])
@@ -238,11 +278,66 @@ def plot_results(stats: RunStats, save_path: Optional[str] = None) -> None:
     axes[0].set_ylabel("seconds")
 
     # KV usage and tokens
-    kv_pct = stats.kv_usage_perc * 100.0
-    axes[1].bar(["KV Usage %"], [kv_pct], color="#E45756")
-    axes[1].set_ylim(0, max(100, kv_pct * 1.2 if kv_pct > 0 else 100))
+    kv_pct_last = stats.kv_usage_perc * 100.0
+    kv_pct_peak = stats.peak_kv_usage_perc * 100.0
+    axes[1].bar(["Last", "Peak"], [kv_pct_last, kv_pct_peak], color=["#E45756", "#F1A340"])
+    axes[1].set_ylim(0, max(100, max(kv_pct_last, kv_pct_peak) * 1.2 if max(kv_pct_last, kv_pct_peak) > 0 else 100))
     axes[1].set_title("KV Cache Usage (%)")
-    axes[1].text(0, kv_pct, f"{kv_pct:.1f}%", ha="center", va="bottom")
+    for i, v in enumerate([kv_pct_last, kv_pct_peak]):
+        axes[1].text(i, v, f"{v:.1f}%", ha="center", va="bottom")
+
+    # KV usage vs frame (using prefill samples mapped by fps)
+    if stats.num_frames > 0 and stats.fps > 0 and stats.prefill_time > 0 and stats.kv_usage_samples:
+        per_frame: List[float] = [0.0] * stats.num_frames
+        has_sample: List[bool] = [False] * stats.num_frames
+        for t_rel, frac in stats.kv_usage_samples:
+            if t_rel < 0:
+                continue
+            if t_rel > stats.prefill_time:
+                continue
+            frame_idx = int(t_rel * stats.fps)
+            if frame_idx >= stats.num_frames:
+                frame_idx = stats.num_frames - 1
+            # store peak per frame segment
+            val = frac * 100.0
+            if not has_sample[frame_idx] or val > per_frame[frame_idx]:
+                per_frame[frame_idx] = val
+                has_sample[frame_idx] = True
+        xs = list(range(stats.num_frames))
+        axes[2].plot(xs, per_frame, marker="o", color="#4C78A8")
+        axes[2].set_xlabel("Frame index")
+        axes[2].set_ylabel("KV Usage (%)")
+        axes[2].set_title("KV Usage vs Frame (prefill phase)")
+        axes[2].set_xlim(-0.5, stats.num_frames - 0.5)
+        axes[2].set_ylim(0, max(100, max(per_frame) * 1.2 if any(has_sample) else 100))
+    else:
+        axes[2].axis("off")
+
+    # KV usage vs generated token (decode phase)
+    if stats.decode_time > 0 and stats.generation_tokens > 0 and stats.kv_usage_samples:
+        tokens_per_sec = stats.generation_tokens / max(stats.decode_time, 1e-6)
+        per_token: List[float] = [0.0] * stats.generation_tokens
+        has_tok: List[bool] = [False] * stats.generation_tokens
+        for t_rel, frac in stats.kv_usage_samples:
+            if t_rel <= stats.prefill_time:
+                continue
+            t_decode = t_rel - stats.prefill_time
+            tok_idx = int(t_decode * tokens_per_sec)
+            if tok_idx >= stats.generation_tokens:
+                tok_idx = stats.generation_tokens - 1
+            val = frac * 100.0
+            if not has_tok[tok_idx] or val > per_token[tok_idx]:
+                per_token[tok_idx] = val
+                has_tok[tok_idx] = True
+        xs = list(range(stats.generation_tokens))
+        axes[3].plot(xs, per_token, marker=".", linestyle="-", color="#2CA02C")
+        axes[3].set_xlabel("Generated token index")
+        axes[3].set_ylabel("KV Usage (%)")
+        axes[3].set_title("KV Usage vs Token (decode phase)")
+        axes[3].set_xlim(-0.5, stats.generation_tokens - 0.5)
+        axes[3].set_ylim(0, max(100, max(per_token) * 1.2 if any(has_tok) else 100))
+    else:
+        axes[3].axis("off")
 
     # Annotate tokens and cache config
     note_lines = [
