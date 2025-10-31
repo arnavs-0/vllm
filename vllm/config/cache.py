@@ -128,6 +128,21 @@ class CacheConfig:
     gpu_memory_utilization. Note that kv_cache_memory_bytes
     (when not-None) ignores gpu_memory_utilization"""
 
+    # KV Cache Compression
+    enable_kv_compression: bool = False
+    """Enable KV cache compression for long sequences (e.g., long videos).
+    When enabled, uses compression strategies like H2O or StreamingLLM to
+    reduce memory usage while maintaining model quality."""
+    kv_compression_strategy: str = "h2o"
+    """KV compression strategy to use. Options: 'h2o', 'streaming_llm'.
+    - 'h2o': Heavy Hitter Oracle, keeps high-attention tokens
+    - 'streaming_llm': Keeps attention sinks + recent tokens"""
+    kv_compression_max_tokens: int = 4096
+    """Start compressing KV cache after this many tokens. For long videos,
+    this threshold determines when compression kicks in."""
+    kv_compression_ratio: float = 0.5
+    """Compression ratio (0-1). 0.5 means keep 50% of tokens after compression."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,

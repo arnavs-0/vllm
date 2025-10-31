@@ -3,7 +3,7 @@
 """Attention layer."""
 
 from collections.abc import Callable
-from typing import cast
+from typing import Optional, cast
 
 import torch
 import torch.nn as nn
@@ -13,6 +13,11 @@ import vllm.envs as envs
 from vllm.attention import AttentionType
 from vllm.attention.backends.abstract import AttentionBackend, MLAAttentionImpl
 from vllm.attention.backends.registry import _Backend, backend_name_to_enum
+from vllm.attention.kv_compression import (
+    CompressionStrategy,
+    KVCacheCompressor,
+    KVCompressionConfig,
+)
 from vllm.attention.selector import get_attn_backend
 from vllm.attention.utils.kv_sharing_utils import validate_kv_sharing_target
 from vllm.config import CacheConfig, get_current_vllm_config

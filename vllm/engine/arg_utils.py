@@ -553,6 +553,12 @@ class EngineArgs:
 
     kv_sharing_fast_prefill: bool = CacheConfig.kv_sharing_fast_prefill
 
+    # KV Cache Compression
+    enable_kv_compression: bool = CacheConfig.enable_kv_compression
+    kv_compression_strategy: str = CacheConfig.kv_compression_strategy
+    kv_compression_max_tokens: int = CacheConfig.kv_compression_max_tokens
+    kv_compression_ratio: float = CacheConfig.kv_compression_ratio
+
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
         # without having to manually construct a
@@ -1391,6 +1397,11 @@ class EngineArgs:
             mamba_cache_dtype=self.mamba_cache_dtype,
             mamba_ssm_cache_dtype=self.mamba_ssm_cache_dtype,
             mamba_block_size=self.mamba_block_size,
+            # KV Cache Compression
+            enable_kv_compression=self.enable_kv_compression,
+            kv_compression_strategy=self.kv_compression_strategy,
+            kv_compression_max_tokens=self.kv_compression_max_tokens,
+            kv_compression_ratio=self.kv_compression_ratio,
         )
 
         ray_runtime_env = None
