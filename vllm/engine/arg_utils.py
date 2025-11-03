@@ -558,6 +558,8 @@ class EngineArgs:
     kv_compression_strategy: str = CacheConfig.kv_compression_strategy
     kv_compression_max_tokens: int = CacheConfig.kv_compression_max_tokens
     kv_compression_ratio: float = CacheConfig.kv_compression_ratio
+    kv_compression_num_sink_tokens: int = CacheConfig.kv_compression_num_sink_tokens
+    kv_compression_num_recent_tokens: int = CacheConfig.kv_compression_num_recent_tokens
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
@@ -1402,6 +1404,8 @@ class EngineArgs:
             kv_compression_strategy=self.kv_compression_strategy,
             kv_compression_max_tokens=self.kv_compression_max_tokens,
             kv_compression_ratio=self.kv_compression_ratio,
+            kv_compression_num_sink_tokens=self.kv_compression_num_sink_tokens,
+            kv_compression_num_recent_tokens=self.kv_compression_num_recent_tokens,
         )
 
         ray_runtime_env = None

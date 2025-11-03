@@ -357,17 +357,18 @@ class Attention(nn.Module, AttentionLayerBase):
 
         # KV Cache Compression
         self.kv_compressor: Optional[KVCacheCompressor] = None
+        self._compression_mask: Optional[torch.Tensor] = None
+        self._compression_debug_logged: bool = False
         if cache_config is not None and cache_config.enable_kv_compression:
             compression_config = KVCompressionConfig(
                 strategy=CompressionStrategy(cache_config.kv_compression_strategy),
                 max_tokens_before_compression=cache_config.kv_compression_max_tokens,
                 compression_ratio=cache_config.kv_compression_ratio,
+                num_sink_tokens=cache_config.kv_compression_num_sink_tokens,
+                num_recent_tokens=cache_config.kv_compression_num_recent_tokens,
             )
             self.kv_compressor = KVCacheCompressor(compression_config)
-            logger.info(
-                f"KV compression enabled for layer {prefix}: "
-                f"strategy={cache_config.kv_compression_strategy}"
-            )
+
 
     def forward(
         self,
@@ -944,6 +945,84 @@ def unified_attention(
         attn_metadata = attn_metadata[layer_name]
     self = forward_context.no_compile_layers[layer_name]
     kv_cache = self.kv_cache[forward_context.virtual_engine]
+    
+    # KV Cache Compression Hook
+    if self.kv_compressor is not None:
+        # Debug log metadata structure (once per layer)
+        if not self._compression_debug_logged:
+            logger.info(f"Compression debug for {layer_name}: attn_metadata type={type(attn_metadata).__name__}, "
+                       f"attrs={[a for a in dir(attn_metadata) if not a.startswith('_')][:10]}")
+            self._compression_debug_logged = True
+        
+        # Try multiple ways to get sequence length
+        seq_len = None
+        if hasattr(attn_metadata, 'seq_lens') and len(attn_metadata.seq_lens) > 0:
+            seq_len = max(attn_metadata.seq_lens)
+        elif hasattr(attn_metadata, 'max_seq_len'):
+            seq_len = attn_metadata.max_seq_len
+        elif hasattr(attn_metadata, 'num_prefill_tokens'):
+            seq_len = attn_metadata.num_prefill_tokens
+        
+        # Track actual sequence length by inferring from previous state
+        # On first call (prefill), _actual_seq_len is None and seq_len is available
+        # On subsequent calls (decode), seq_len may be None but we increment based on previous state
+        
+        if self.kv_compressor._actual_seq_len is None:
+            # First time seeing this sequence - need seq_len from metadata
+            if seq_len is not None and seq_len > 0:
+                self.kv_compressor._actual_seq_len = seq_len
+                if layer_name == "language_model.layers.0.self_attn.attn":
+                    logger.info(f"Prefill: initializing seq_len={seq_len}")
+        else:
+            # Already initialized - this is a decode step
+            # Increment sequence length regardless of whether metadata has seq_len
+            # Only increment ONCE per forward batch (not once per layer!)
+            from vllm.attention.kv_compression import _global_forward_call_counter
+            
+            counter_key = f"{self.kv_compressor._seq_tracker_key}_forward_count"
+            if counter_key not in _global_forward_call_counter:
+                _global_forward_call_counter[counter_key] = 0
+            
+            current_count = _global_forward_call_counter[counter_key]
+            
+            # Increment the counter for this forward pass
+            _global_forward_call_counter[counter_key] += 1
+            
+            # Only increment seq_len on the FIRST layer (layer 0)
+            # This ensures we increment once per token, not once per layer
+            if layer_name == "language_model.layers.0.self_attn.attn":
+                old_len = self.kv_compressor._actual_seq_len
+                self.kv_compressor._actual_seq_len += 1
+                logger.info(f"Decode: {old_len} -> {self.kv_compressor._actual_seq_len} (metadata seq_len={seq_len}, forward_count={current_count})")
+        
+        # Use the tracked sequence length for compression decisions
+        actual_len = self.kv_compressor._actual_seq_len
+        
+        # KV Compression: Apply at attention layer (identifies tokens to evict)
+        if actual_len is not None and self.kv_compressor.should_compress(actual_len):
+            # Apply compression to KV cache
+            _, _, keep_mask, compression_info = self.kv_compressor.compress(
+                kv_cache, kv_cache, actual_len
+            )
+            # Store the mask - it identifies which KV cache entries to keep
+            self._compression_mask = keep_mask
+            # Store compression info for potential block freeing
+            self._compression_info = compression_info
+            
+            # Log which positions are being used for attention
+            if layer_name == "language_model.layers.0.self_attn.attn":
+                kept_positions = torch.where(keep_mask)[0].tolist() if keep_mask is not None else []
+                if kept_positions:
+                    logger.info(
+                        f"Attention using compressed cache: "
+                        f"{len(kept_positions)} positions kept "
+                        f"(first 5: {kept_positions[:5]}, last 5: {kept_positions[-5:]})"
+                    )
+            
+            # NOTE: We don't create attn_bias here as it causes shape errors
+            # The mask is stored for reference but actual memory freeing
+            # would need to happen at worker level
+    
     output = self.impl.forward(self, query, key, value, kv_cache, attn_metadata)
 
     maybe_save_kv_layer_to_connector(layer_name, kv_cache)
@@ -982,6 +1061,28 @@ def unified_attention_with_output(
         attn_metadata = attn_metadata[layer_name]
     self = forward_context.no_compile_layers[layer_name]
     kv_cache = self.kv_cache[forward_context.virtual_engine]
+    
+    # KV Cache Compression Hook
+    if self.kv_compressor is not None:
+        # Try multiple ways to get sequence length
+        seq_len = None
+        if hasattr(attn_metadata, 'seq_lens') and len(attn_metadata.seq_lens) > 0:
+            seq_len = max(attn_metadata.seq_lens)
+        elif hasattr(attn_metadata, 'max_seq_len'):
+            seq_len = attn_metadata.max_seq_len
+        elif hasattr(attn_metadata, 'num_prefill_tokens'):
+            seq_len = attn_metadata.num_prefill_tokens
+        
+        if seq_len is not None and self.kv_compressor.should_compress(seq_len):
+            # Apply compression to KV cache
+            _, _, keep_mask, compression_info = self.kv_compressor.compress(
+                kv_cache, kv_cache, seq_len
+            )
+            # Store the mask for potential use by attention backend
+            self._compression_mask = keep_mask
+            # Store compression info for potential block freeing
+            self._compression_info = compression_info
+    
     self.impl.forward(
         self,
         query,

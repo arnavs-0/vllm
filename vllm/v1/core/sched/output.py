@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from vllm._bc_linter import bc_linter_include
@@ -174,3 +174,7 @@ class SchedulerOutput:
 
     # KV Cache Connector metadata.
     kv_connector_metadata: KVConnectorMetadata | None = None
+
+    # Block IDs that have been freed and should be zeroed in the worker's KV cache
+    # This enables actual GPU memory "freeing" by zeroing out evicted blocks
+    freed_block_ids: set[int] = field(default_factory=set)

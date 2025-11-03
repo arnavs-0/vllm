@@ -131,17 +131,23 @@ class CacheConfig:
     # KV Cache Compression
     enable_kv_compression: bool = False
     """Enable KV cache compression for long sequences (e.g., long videos).
-    When enabled, uses compression strategies like H2O or StreamingLLM to
-    reduce memory usage while maintaining model quality."""
-    kv_compression_strategy: str = "h2o"
-    """KV compression strategy to use. Options: 'h2o', 'streaming_llm'.
-    - 'h2o': Heavy Hitter Oracle, keeps high-attention tokens
+    When enabled, uses StreamingLLM compression to reduce memory usage."""
+    kv_compression_strategy: str = "streaming_llm"
+    """KV compression strategy to use. Currently only 'streaming_llm' is supported.
     - 'streaming_llm': Keeps attention sinks + recent tokens"""
     kv_compression_max_tokens: int = 4096
     """Start compressing KV cache after this many tokens. For long videos,
     this threshold determines when compression kicks in."""
     kv_compression_ratio: float = 0.5
     """Compression ratio (0-1). 0.5 means keep 50% of tokens after compression."""
+    kv_compression_num_sink_tokens: int = 4
+    """Number of initial 'attention sink' tokens to always keep when using 
+    StreamingLLM compression. These are the first N tokens that typically 
+    receive high attention scores."""
+    kv_compression_num_recent_tokens: int = 128
+    """Number of recent tokens to keep when using StreamingLLM compression.
+    Together with sink tokens, this determines how many tokens remain after
+    compression. Note: Memory is not freed yet, but tokens are marked for eviction."""
 
     def compute_hash(self) -> str:
         """

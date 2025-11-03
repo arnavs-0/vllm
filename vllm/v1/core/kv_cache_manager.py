@@ -111,8 +111,8 @@ class KVCacheManager:
         # FIXME: make prefix cache stats conditional on log_stats
         self.prefix_cache_stats = PrefixCacheStats() if log_stats else None
         
-        # Store cache_config for KV compression
         self.cache_config = cache_config
+        self.kv_compressor = None
 
         self.block_size: int | None = None
         if self.enable_caching:
@@ -284,20 +284,6 @@ class KVCacheManager:
             request.request_id, request.num_computed_tokens
         )
 
-        # KV Cache Compression: Check if we need to compress before allocating
-        if (
-            self.cache_config is not None
-            and self.cache_config.enable_kv_compression
-            and self.cache_config.kv_compression_strategy == "streaming_llm"
-        ):
-            # Calculate total tokens after this allocation
-            num_computed_tokens = request.num_computed_tokens + num_new_computed_tokens
-            total_tokens_after_alloc = num_computed_tokens + num_new_tokens
-            
-            # Check if we exceed the compression threshold
-            if total_tokens_after_alloc > self.cache_config.kv_compression_max_tokens:
-                self._compress_kv_cache_streaming_llm(request, total_tokens_after_alloc)
-
         # The number of computed tokens is the number of computed tokens plus
         # the new prefix caching hits
         num_computed_tokens = request.num_computed_tokens + num_new_computed_tokens
@@ -431,88 +417,6 @@ class KVCacheManager:
         """Cache the blocks for the request, if enabled."""
         if self.enable_caching:
             self.coordinator.cache_blocks(request, num_computed_tokens)
-
-    def _compress_kv_cache_streaming_llm(
-        self, request: Request, current_tokens: int
-    ) -> int:
-        """Compress KV cache using StreamingLLM strategy.
-        
-        StreamingLLM keeps:
-        - First N tokens (attention sinks)
-        - Last M tokens (recent context)
-        - Evicts middle tokens
-        
-        Args:
-            request: The request to compress cache for
-            current_tokens: Current total number of tokens
-            
-        Returns:
-            Number of tokens evicted
-        """
-        if self.cache_config is None:
-            return 0
-            
-        max_tokens = self.cache_config.kv_compression_max_tokens
-        
-        # Calculate how many tokens to keep in each section
-        # Keep 10% as attention sinks, 90% as recent tokens
-        num_sinks = int(max_tokens * 0.1)
-        num_recent = max_tokens - num_sinks
-        
-        # Calculate how many tokens to evict
-        tokens_to_evict = current_tokens - max_tokens
-        if tokens_to_evict <= 0:
-            return 0
-        
-        # Get current blocks for this request
-        current_blocks = self.coordinator.get_blocks(request.request_id)
-        if not current_blocks or not any(current_blocks):
-            return 0
-        
-        # For simplicity, work with the first KV cache group
-        # (most models have only one group)
-        group_blocks = current_blocks[0]
-        if not group_blocks:
-            return 0
-        
-        # Calculate block indices to evict
-        # Keep first num_sinks tokens and last num_recent tokens
-        assert self.block_size is not None
-        block_size = self.block_size
-        
-        # Start evicting after the sink tokens
-        start_evict_token = num_sinks
-        end_evict_token = current_tokens - num_recent
-        
-        if start_evict_token >= end_evict_token:
-            return 0
-        
-        start_evict_block = start_evict_token // block_size
-        end_evict_block = (end_evict_token + block_size - 1) // block_size
-        
-        # Don't evict beyond what exists
-        end_evict_block = min(end_evict_block, len(group_blocks))
-        
-        if start_evict_block >= end_evict_block:
-            return 0
-        
-        # Free the middle blocks
-        blocks_to_evict = group_blocks[start_evict_block:end_evict_block]
-        evicted_count = 0
-        for block in blocks_to_evict:
-            self.block_pool.free(block)
-            evicted_count += 1
-        
-        tokens_evicted = evicted_count * block_size
-        
-        logger.info(
-            f"KV cache compressed for request {request.request_id}: "
-            f"evicted {tokens_evicted} tokens ({evicted_count} blocks) "
-            f"from {current_tokens} total tokens. "
-            f"Kept {num_sinks} sink tokens + {num_recent} recent tokens."
-        )
-        
-        return tokens_evicted
 
     def create_kv_cache_blocks(
         self, blocks: tuple[list[KVCacheBlock], ...]

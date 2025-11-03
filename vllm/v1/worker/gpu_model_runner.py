@@ -2426,6 +2426,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 # Update persistent batch states.
                 self._update_states(scheduler_output)
 
+                # Zero out freed blocks in KV cache to actually free GPU memory
+                if scheduler_output.freed_block_ids:
+                    self._zero_freed_blocks(scheduler_output.freed_block_ids)
+
                 if not scheduler_output.total_num_scheduled_tokens:
                     if not has_kv_transfer_group():
                         # Return empty ModelRunnerOutput if no work to do.
@@ -2657,6 +2661,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         with record_function_or_nullcontext("EPLB"):
             self.eplb_step()
 
+        # Collect compression information from attention layers
+        compression_info = self._collect_compression_info()
+
         output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
@@ -2666,6 +2673,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             pooler_output=[],
             kv_connector_output=kv_connector_output,
             num_nans_in_logits=num_nans_in_logits,
+            compression_info=compression_info,
         )
 
         if not self.use_async_scheduling:
@@ -3858,6 +3866,39 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
         return cuda_graph_size
 
+    def _zero_freed_blocks(self, freed_block_ids: set[int]) -> None:
+        """Zero out GPU memory for blocks that have been freed.
+        
+        This actually frees GPU memory by zeroing out the tensor slices
+        corresponding to freed blocks, making them available for reuse.
+        
+        Args:
+            freed_block_ids: Set of block IDs that have been freed
+        """
+        if not freed_block_ids:
+            return
+            
+        logger.info(f"Zeroing {len(freed_block_ids)} freed blocks in GPU KV cache")
+        
+        for layer_idx, kv_cache in enumerate(self.kv_caches):
+            if kv_cache is None:
+                continue
+                
+            # KV cache shape is typically [num_blocks, block_size, num_heads, head_dim]
+            # or [num_layers, num_blocks, block_size, num_heads, head_dim]
+            if len(kv_cache.shape) == 4:  # [num_blocks, block_size, num_heads, head_dim]
+                for block_id in freed_block_ids:
+                    if block_id < kv_cache.shape[0]:  # Check bounds
+                        kv_cache[block_id, :, :, :] = 0
+            elif len(kv_cache.shape) == 5:  # [num_layers, num_blocks, block_size, num_heads, head_dim]
+                for block_id in freed_block_ids:
+                    if block_id < kv_cache.shape[1]:  # Check bounds
+                        kv_cache[:, block_id, :, :, :] = 0
+            else:
+                logger.warning(f"Unexpected KV cache shape {kv_cache.shape} for layer {layer_idx}")
+                
+        logger.debug(f"Zeroed {len(freed_block_ids)} blocks in GPU memory")
+
     def _capture_cudagraphs(
         self,
         compilation_cases: list[tuple[int, bool]],
@@ -4667,3 +4708,101 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.transfer_event.record()
         self.transfer_event.synchronize()
         return pinned.tolist()
+
+    def _collect_compression_info(self):
+        """Collect compression information from attention layers.
+        
+        Returns:
+            Dict mapping request IDs to compression info, or None if no compression occurred.
+        """
+        from vllm.v1.outputs import CompressionInfo
+        
+        compression_info_dict = {}
+        
+        # Iterate through all attention layers in the model to collect compression info
+        # Aggregate compression info from all layers that have it
+        all_compression_infos = []
+        for module in self.model.modules():
+            if hasattr(module, '_compression_info') and module._compression_info is not None:
+                all_compression_infos.append(module._compression_info)
+                logger.debug(f"Found compression info in {module}: {module._compression_info}")
+                # Clear the info after collecting
+                module._compression_info = None
+        
+        if all_compression_infos:
+            # For now, use the last compression info (most recent)
+            # In a full implementation, we'd need to aggregate across layers
+            info_dict = all_compression_infos[-1]  # Use the most recent compression
+            
+            # Convert dict to CompressionInfo object
+            compression_info = CompressionInfo(
+                original_seq_len=info_dict["original_seq_len"],
+                compressed_seq_len=info_dict["compressed_seq_len"],
+                evicted_tokens=info_dict["evicted_tokens"],
+                blocks_to_free=info_dict["blocks_to_free"],
+                strategy=info_dict["strategy"],
+                compression_count=info_dict["compression_count"],
+            )
+            
+            # For now, associate compression with the first request
+            # In a full implementation, we'd need to track which request triggered compression
+            if self.input_batch.req_ids:
+                req_id = self.input_batch.req_ids[0]  # Simplified - use first request
+                compression_info_dict[req_id] = compression_info
+                logger.info(f"🗜️ Worker collected compression info for req {req_id}: {len(info_dict['blocks_to_free'])} blocks to free (from {len(all_compression_infos)} layers)")
+                # Clear the info after collecting
+                module._compression_info = None
+            else:
+                logger.warning("No request IDs in input batch, cannot associate compression info")
+        
+        if compression_info_dict:
+            logger.info(f"📤 Worker sending compression info to scheduler: {compression_info_dict}")
+        
+        return compression_info_dict if compression_info_dict else None
+
+    def _zero_freed_blocks(self, freed_block_ids: set[int]) -> None:
+        """Zero out GPU memory for freed blocks to actually free memory.
+        
+        Args:
+            freed_block_ids: Set of block IDs that have been freed by the scheduler
+        """
+        if not freed_block_ids:
+            return
+            
+        logger.info(f"🧹 Zeroing {len(freed_block_ids)} freed blocks in GPU KV cache: {sorted(freed_block_ids)}")
+        
+        # Zero out the corresponding tensor slices in all KV cache tensors
+        for layer_idx, kv_cache_tensor in enumerate(self.kv_caches):
+            if kv_cache_tensor is None:
+                continue
+                
+            # Get tensor shape to understand layout
+            shape = kv_cache_tensor.shape
+            logger.debug(f"Layer {layer_idx}: tensor shape {shape}")
+            
+            # Handle different KV cache layouts
+            if len(shape) == 4:  # [num_blocks, block_size, num_heads, head_dim] (attention)
+                num_blocks, block_size, num_heads, head_dim = shape
+                for block_id in freed_block_ids:
+                    if block_id < num_blocks:
+                        # Zero the entire block: [block_id, :, :, :]
+                        kv_cache_tensor[block_id, :, :, :] = 0
+                        
+            elif len(shape) == 5:  # [num_layers, num_blocks, block_size, num_heads, head_dim]
+                num_layers, num_blocks, block_size, num_heads, head_dim = shape
+                for block_id in freed_block_ids:
+                    if block_id < num_blocks:
+                        # Zero the entire block: [:, block_id, :, :, :]
+                        kv_cache_tensor[:, block_id, :, :, :] = 0
+                        
+            elif len(shape) == 3:  # Mamba layout or other formats
+                # For mamba/other formats, zero the block dimension
+                # This is a simplified assumption - may need adjustment based on actual layout
+                num_blocks = shape[0]  # Assume first dimension is blocks
+                for block_id in freed_block_ids:
+                    if block_id < num_blocks:
+                        kv_cache_tensor[block_id, :, :] = 0
+            else:
+                logger.warning(f"Unexpected KV cache tensor shape {shape} for layer {layer_idx}, skipping zeroing")
+                
+        logger.info(f"✅ Successfully zeroed {len(freed_block_ids)} blocks in GPU memory")

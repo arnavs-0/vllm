@@ -119,13 +119,28 @@ class KVConnectorOutput:
     # for a given connector after discovery. Default value entails no change.
     expected_finished_count: int = 0
 
-    def is_empty(self):
-        return (
-            not self.finished_sending
-            and not self.finished_recving
-            and not self.kv_connector_stats
-            and not self.invalid_block_ids
-        )
+
+@dataclass
+class CompressionInfo:
+    """Information about KV cache compression for block freeing.
+
+    This is communicated from the worker to the scheduler to enable
+    actual memory block deallocation after compression.
+    """
+
+    # Sequence length before compression
+    original_seq_len: int
+    # Sequence length after compression (kept tokens)
+    compressed_seq_len: int
+    # Number of tokens evicted during compression
+    evicted_tokens: int
+    # Set of block IDs that contain only evicted tokens and can be freed
+    # These blocks are completely empty after compression
+    blocks_to_free: set[int]
+    # Compression strategy used (for logging/debugging)
+    strategy: str
+    # Compression statistics
+    compression_count: int
 
 
 # ModelRunnerOutput is serialized and sent to the scheduler process.
@@ -161,6 +176,10 @@ class ModelRunnerOutput:
 
     # req_id -> num_nans_in_logits
     num_nans_in_logits: dict[str, int] | None = None
+
+    # req_id -> compression information for block freeing
+    # Contains information about which blocks can be freed after compression
+    compression_info: dict[str, "CompressionInfo"] | None = None
 
 
 # ModelRunnerOutput wrapper for async scheduling.
