@@ -6,6 +6,7 @@ Quick test to verify KV compression implementation.
 def test_compression():
     """Run quick tests to verify compression works"""
     from vllm import LLM, SamplingParams
+    import torch
     
     print("="*80)
     print("QUICK COMPRESSION TEST")
@@ -28,6 +29,15 @@ def test_compression():
     print(f"Generated output: {outputs[0].outputs[0].text[:50]}...")
     print(f"No crashes - compression hook is stable")
     
+    # Clean up GPU resources before next test
+    del llm
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    import gc
+    gc.collect()
+    import time
+    time.sleep(2)  # Give system time to release resources
+    
     # Test 2: Verify compression with longer sequence
     print("\n[Test 2] Verifying compression calculation...")
     llm2 = LLM(
@@ -49,7 +59,6 @@ def test_compression():
     # Test 3: Verify compression math (direct test)
     print("\n[Test 3] Verifying compression calculation...")
     from vllm.attention.kv_compression import KVCacheCompressor, KVCompressionConfig, CompressionStrategy
-    import torch
     
     config = KVCompressionConfig(
         strategy=CompressionStrategy.STREAMING_LLM,
