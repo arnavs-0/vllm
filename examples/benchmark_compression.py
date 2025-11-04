@@ -122,7 +122,7 @@ def benchmark_model(
               f"sink={num_sink_tokens}, recent={num_recent_tokens}")
     print(f"{'='*80}\n")
 
-    # Clear GPU memory and start memory tracking
+    # Clear GPU memory and start memory tracking BEFORE model loading
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
@@ -130,8 +130,14 @@ def benchmark_model(
     if HAS_TRACEMALLOC:
         tracemalloc.start()
 
+    # Get baseline memory BEFORE model initialization
+    baseline_memory = get_memory_usage()
+
     # Measure model initialization time
     init_start = time.perf_counter()
+    
+    # Get baseline memory BEFORE model initialization
+    baseline_memory = get_memory_usage()
     
     llm_kwargs = {
         "model": "Qwen/Qwen2-VL-2B-Instruct",
@@ -182,6 +188,11 @@ def benchmark_model(
     num_prompt_tokens = len(tokenizer.encode(prompt)) + (num_frames * 120)  # Approx 120 tokens per frame
     print(f"✓ Video processed in {process_time:.2f}s")
     print(f"✓ Prompt tokens (approx): {num_prompt_tokens}")
+    print(f"✓ Compression threshold: {compression_threshold if enable_compression else 'N/A'}")
+    if enable_compression and num_prompt_tokens > compression_threshold:
+        print(f"✓ Compression should trigger (prompt tokens > threshold)")
+    elif enable_compression:
+        print(f"⚠️  Compression may not trigger (prompt tokens <= threshold)")
     print_memory_usage(prefill_memory, "Memory After Prefill")
     
     # Generate output
@@ -236,10 +247,10 @@ def benchmark_model(
     print_memory_usage(final_memory, "Final Memory Usage")
 
     # Show memory deltas
-    print(f"\n📈 MEMORY DELTAS (from init):")
+    print(f"\n📈 MEMORY DELTAS (from baseline):")
     for key in final_memory:
-        if key in init_memory:
-            delta = final_memory[key] - init_memory[key]
+        if key in baseline_memory:
+            delta = final_memory[key] - baseline_memory[key]
             key_name = key.replace('_', ' ').title()
             print(f"   {key_name}: {delta:+.1f} MB")
 
@@ -263,6 +274,7 @@ def benchmark_model(
         "total_gen_time": total_gen_time,
         "time_per_token_ms": time_per_token_ms,
         "throughput": throughput,
+        "baseline_memory": baseline_memory,
         "init_memory": init_memory,
         "prefill_memory": prefill_memory,
         "final_memory": final_memory,
@@ -302,16 +314,29 @@ def compare_results(baseline, compressed):
     print(f"{'Metric':<30} {'Baseline':<15} {'Compressed':<15} {'Savings':<15}")
     print(f"{'-'*75}")
 
+    # Compare peak memory usage (more relevant for compression)
+    print(f"{'PEAK MEMORY USAGE':<30} {'(MB)':<15} {'(MB)':<15} {'(%)':<15}")
+    peak_keys = ['gpu_max_allocated', 'cpu_rss', 'cpu_vms', 'python_peak']
+    for key in peak_keys:
+        if key in baseline['final_memory'] and key in compressed['final_memory']:
+            baseline_val = baseline['final_memory'][key]
+            compressed_val = compressed['final_memory'][key]
+            savings = (1 - compressed_val / baseline_val) * 100 if baseline_val > 0 else 0
+            key_name = key.replace('_', ' ').title().replace('Max Allocated', 'Peak Alloc')
+            print(f"{'Peak ' + key_name:<30} {baseline_val:.1f}{'':<9} "
+                  f"{compressed_val:.1f}{'':<9} {savings:+.1f}%")
+
     # Compare final memory usage for each metric
-    memory_keys = ['gpu_allocated', 'gpu_reserved', 'gpu_max_allocated', 'cpu_rss', 'cpu_vms', 'python_current', 'python_peak']
+    print(f"\n{'FINAL MEMORY USAGE':<30} {'(MB)':<15} {'(MB)':<15} {'(%)':<15}")
+    memory_keys = ['gpu_allocated', 'gpu_reserved', 'cpu_rss', 'cpu_vms', 'python_current']
     for key in memory_keys:
         if key in baseline['final_memory'] and key in compressed['final_memory']:
             baseline_val = baseline['final_memory'][key]
             compressed_val = compressed['final_memory'][key]
             savings = (1 - compressed_val / baseline_val) * 100 if baseline_val > 0 else 0
             key_name = key.replace('_', ' ').title()
-            print(f"{'Final ' + key_name:<30} {baseline_val:.1f} MB{'':<8} "
-                  f"{compressed_val:.1f} MB{'':<8} {savings:+.1f}%")
+            print(f"{'Final ' + key_name:<30} {baseline_val:.1f}{'':<9} "
+                  f"{compressed_val:.1f}{'':<9} {savings:+.1f}%")
 
     print(f"\n📝 OUTPUT QUALITY:")
     print(f"{'Metric':<30} {'Baseline':<15} {'Compressed':<15} {'Match':<15}")
@@ -361,6 +386,7 @@ def compare_results(baseline, compressed):
 
 
 def main():
+    import gc  # Import gc for cleanup
     parser = argparse.ArgumentParser(description="Benchmark compression time and memory")
     parser.add_argument("--num-frames", type=int, default=4, help="Number of video frames")
     parser.add_argument("--max-tokens", type=int, default=100, help="Max tokens to generate")
@@ -389,7 +415,6 @@ def main():
         # Clean up GPU resources before next test
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        import gc
         gc.collect()
         
         # Wait a bit between runs
