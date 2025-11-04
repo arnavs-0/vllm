@@ -114,7 +114,14 @@ class KVCacheCompressor:
         _global_seq_len_tracker[f"{self._seq_tracker_key}_last_compressed"] = value
     
     def should_compress(self, current_seq_len: int) -> bool:
-        """Check if compression should be applied"""
+        """Check if compression should be applied
+        
+        During CUDA graph capture, we cannot perform dynamic operations,
+        so we skip compression to avoid capture errors.
+        """
+        # Skip compression during CUDA graph capture
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return False
         # Use tracked sequence length if available, otherwise use provided
         if self._actual_seq_len is not None:
             actual_len = self._actual_seq_len
@@ -164,6 +171,11 @@ class KVCacheCompressor:
         Returns:
             compressed_keys, compressed_values, keep_mask
         """
+        # Skip compression during CUDA graph capture
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            # Return identity mask (keep everything)
+            keep_mask = torch.ones(seq_len, dtype=torch.bool, device=key_cache.device)
+            return key_cache, value_cache, keep_mask
         # Use tracked sequence length for proper accumulation
         if self._actual_seq_len is not None:
             actual_seq_len = self._actual_seq_len
@@ -220,6 +232,9 @@ class KVCacheCompressor:
             compressed_keys, compressed_values, keep_mask (None if no compression),
             compression_info (dict with block freeing info, None if no compression)
         """
+        # Skip compression during CUDA graph capture
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return key_cache, value_cache, None, None
         if not self.should_compress(seq_len):
             return key_cache, value_cache, None, None
         
