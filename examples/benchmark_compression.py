@@ -251,6 +251,11 @@ def benchmark_model(
     print(f"   {output_text[:200]}...")
     print(f"{'='*80}\n")
     
+    # Clean up LLM object to free GPU resources
+    del llm
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
     return {
         "mode": mode,
         "init_time": init_time,
@@ -381,6 +386,12 @@ def main():
         )
         results['baseline'] = baseline_result
         
+        # Clean up GPU resources before next test
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        import gc
+        gc.collect()
+        
         # Wait a bit between runs
         time.sleep(2)
     
@@ -398,6 +409,11 @@ def main():
             num_recent_tokens=args.num_recent,
         )
         results['compressed'] = compressed_result
+        
+        # Clean up GPU resources after compressed test
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
     
     # Compare results
     if 'baseline' in results and 'compressed' in results:
