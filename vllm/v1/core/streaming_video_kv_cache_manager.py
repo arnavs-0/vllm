@@ -69,53 +69,60 @@ class StreamingVideoKVCacheManager(SingleTypeKVCacheManager):
         self, request_id: str, num_tokens: int
     ) -> list[KVCacheBlock]:
         """
-        Allocate blocks with constant memory streaming policy.
+        Allocate new blocks for a request, capping at max_allowed_blocks.
         
-        Maintains a constant number of blocks (sink + recent) by capping allocation.
-        Does NOT free blocks to avoid sparse block table issues in V1.
+        During prefill: Allow full allocation (let video frames load normally)
+        During generation: Cap at sink + recent window
         
-        The dual compression works as:
-        - V1 Block Manager (this): Caps total blocks at sink + recent
-        - V0 Attention Layer: Masks middle tokens during attention
-        
-        This creates O(1) memory usage for infinite sequences.
+        This creates O(1) memory usage during generation while preserving
+        full prefill accuracy.
         """
         req_blocks = self.req_to_blocks[request_id]
         num_required_blocks = cdiv(num_tokens, self.block_size)
         
-        # Cap at maximum allowed blocks (sink + recent)
-        max_allowed_blocks = self.num_sink_blocks + self.num_recent_blocks
-        num_required_blocks = min(num_required_blocks, max_allowed_blocks)
+        # Check if this is initial prefill or generation
+        is_prefill = len(req_blocks) == 0
+        
+        if not is_prefill:
+            # During generation: Cap at maximum allowed blocks (sink + recent)
+            max_allowed_blocks = self.num_sink_blocks + self.num_recent_blocks
+            num_required_blocks = min(num_required_blocks, max_allowed_blocks)
         
         num_new_blocks = num_required_blocks - len(req_blocks)
         
         if num_new_blocks <= 0:
             # Already at capacity - blocks are reused via attention masking
+            if not is_prefill:
+                logger.debug(
+                    f"⚠️  Request {request_id} at capacity - reusing blocks (generation mode)"
+                )
             return []
         
-        # Allocate new blocks (only until we hit max_allowed_blocks)
+        # Allocate new blocks
         new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
         req_blocks.extend(new_blocks)
         
         # Track allocation order
         self.block_allocation_order[request_id].extend(new_blocks)
         
-        # Mark sink blocks on first allocation
-        if request_id not in self.sink_blocks:
+        # Mark sink blocks on first allocation (prefill)
+        if is_prefill:
             # First allocation - mark the first num_sink_blocks as sinks
             num_sink = min(self.num_sink_blocks, len(req_blocks))
             self.sink_blocks[request_id] = req_blocks[:num_sink]
             logger.info(
-                f"Marked {num_sink} sink blocks for request {request_id}"
+                f"✅ Prefill: Allocated {len(req_blocks)} blocks for request {request_id}, "
+                f"marked {num_sink} as sink blocks"
             )
-        
-        # Log when we hit capacity
-        if len(req_blocks) >= max_allowed_blocks:
-            logger.info(
-                f"🎯 Reached maximum capacity ({max_allowed_blocks} blocks) for request {request_id}. "
-                f"Structure: {len(self.sink_blocks.get(request_id, []))} sink + {self.num_recent_blocks} recent. "
-                f"Future tokens will reuse existing blocks (attention layer masks middle)."
-            )
+        else:
+            # Generation: Check if we hit capacity
+            max_allowed_blocks = self.num_sink_blocks + self.num_recent_blocks
+            if len(req_blocks) >= max_allowed_blocks:
+                logger.info(
+                    f"🎯 Reached maximum capacity ({max_allowed_blocks} blocks) for request {request_id}. "
+                    f"Structure: {len(self.sink_blocks.get(request_id, []))} sink + {self.num_recent_blocks} recent. "
+                    f"Future tokens will reuse existing blocks (attention layer masks middle)."
+                )
         
         return new_blocks
     
