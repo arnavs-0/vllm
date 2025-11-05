@@ -187,7 +187,7 @@ def benchmark_model(
         # This avoids dual compression overhead
         llm_kwargs.update({
             "enable_kv_compression": True,
-            # NOTE: No kv_compression_strategy - this triggers block manager only
+            "kv_compression_strategy": "none",  # Disable V0 attention layer compression (streaming_llm)
             "kv_compression_max_tokens": compression_threshold,
             "kv_compression_num_sink_tokens": num_sink_tokens,
             "kv_compression_num_recent_tokens": num_recent_tokens,
@@ -448,7 +448,7 @@ def main():
     parser = argparse.ArgumentParser(description="Benchmark compression time and memory")
     parser.add_argument("--num-frames", type=int, default=4, help="Number of video frames")
     parser.add_argument("--max-tokens", type=int, default=100, help="Max tokens to generate")
-    parser.add_argument("--threshold", type=int, default=50, help="Compression threshold")
+    parser.add_argument("--threshold", type=int, default=5000, help="Compression threshold (tokens before compression triggers)")
     parser.add_argument("--num-sink", type=int, default=4, help="Number of sink tokens")
     parser.add_argument("--num-recent", type=int, default=128, help="Number of recent tokens")
     parser.add_argument("--baseline-only", action="store_true", help="Run only baseline")
