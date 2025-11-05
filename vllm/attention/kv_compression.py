@@ -53,6 +53,10 @@ class KVCompressionConfig:
     # Compression frequency
     compress_every_n_tokens: int = 256  # Check for compression this often
     
+    # Video streaming specific
+    enable_block_manager_integration: bool = True  # Use block-level freeing
+    tokens_per_video_frame: int = 120  # Approximate tokens per video frame
+    
     def __post_init__(self):
         if self.strategy != CompressionStrategy.NONE:
             logger.info(

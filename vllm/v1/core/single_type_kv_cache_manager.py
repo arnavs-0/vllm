@@ -693,8 +693,48 @@ spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
 
 
 def get_manager_for_kv_cache_spec(
-    kv_cache_spec: KVCacheSpec, **kwargs
+    kv_cache_spec: KVCacheSpec,
+    enable_kv_compression: bool = False,
+    kv_compression_num_sink_tokens: int = 4,
+    kv_compression_num_recent_tokens: int = 128,
+    **kwargs
 ) -> SingleTypeKVCacheManager:
+    """
+    Factory function to create the appropriate KV cache manager.
+    
+    If compression is enabled for FullAttentionSpec, returns StreamingVideoKVCacheManager.
+    Otherwise, returns the standard manager for the spec type.
+    """
+    # Check if we should use streaming video manager
+    if enable_kv_compression and isinstance(kv_cache_spec, FullAttentionSpec):
+        from vllm.v1.core.streaming_video_kv_cache_manager import StreamingVideoKVCacheManager
+        
+        # Convert token counts to block counts
+        block_size = kv_cache_spec.block_size
+        dcp_world_size = kwargs.get('dcp_world_size', 1)
+        if dcp_world_size > 1:
+            block_size *= dcp_world_size
+            
+        num_sink_blocks = max(1, kv_compression_num_sink_tokens // block_size)
+        num_recent_blocks = max(1, kv_compression_num_recent_tokens // block_size)
+        
+        # Extract required positional arguments from kwargs
+        block_pool = kwargs.pop('block_pool')
+        kv_cache_group_id = kwargs.pop('kv_cache_group_id')
+        dcp_world_size_arg = kwargs.pop('dcp_world_size', 1)
+        
+        manager = StreamingVideoKVCacheManager(
+            kv_cache_spec=kv_cache_spec,
+            block_pool=block_pool,
+            kv_cache_group_id=kv_cache_group_id,
+            dcp_world_size=dcp_world_size_arg,
+            num_sink_blocks=num_sink_blocks,
+            num_recent_blocks=num_recent_blocks,
+        )
+        return manager
+    
+    # Standard manager selection
     manager_class = spec_manager_map[type(kv_cache_spec)]
     manager = manager_class(kv_cache_spec, **kwargs)
     return manager
+
