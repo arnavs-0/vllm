@@ -260,7 +260,11 @@ def benchmark_model(
     # Extract output
     output_text = outputs[0].outputs[0].text
     num_output_tokens = len(outputs[0].outputs[0].token_ids)
-
+    
+    # Get ACTUAL prompt token count from output metadata
+    actual_prompt_tokens = len(outputs[0].prompt_token_ids)
+    total_tokens_generated = actual_prompt_tokens + num_output_tokens
+    
     # Calculate metrics
     throughput = num_output_tokens / total_gen_time if total_gen_time > 0 else 0
     time_per_token_ms = (total_gen_time / num_output_tokens * 1000) if num_output_tokens > 0 else 0
@@ -291,9 +295,16 @@ def benchmark_model(
             print(f"   {key_name}: {delta:+.1f} MB")
 
     print(f"\n📝 TOKENS:")
-    print(f"   Input tokens:         {num_prompt_tokens}")
+    print(f"   Input tokens (actual): {actual_prompt_tokens}")
     print(f"   Output tokens:        {num_output_tokens}")
-    print(f"   Total tokens:         {num_prompt_tokens + num_output_tokens}")
+    print(f"   Total tokens:         {total_tokens_generated}")
+    if enable_compression:
+        print(f"   Compression config:   sink={num_sink_tokens}, recent={num_recent_tokens} (cap={num_sink_tokens + num_recent_tokens})")
+        if total_tokens_generated > compression_threshold:
+            print(f"   ✓ Compression TRIGGERED (total={total_tokens_generated} > threshold={compression_threshold})")
+            print(f"   ✓ Tokens should be capped at ~{num_sink_tokens + num_recent_tokens} after compression")
+        else:
+            print(f"   ⚠️  Compression NOT triggered (total={total_tokens_generated} <= threshold={compression_threshold})")
     print(f"\n📄 OUTPUT ({len(output_text)} chars):")
     print(f"   {output_text[:200]}...")
     print(f"{'='*80}\n")
@@ -314,8 +325,9 @@ def benchmark_model(
         "init_memory": init_memory,
         "prefill_memory": prefill_memory,
         "final_memory": final_memory,
-        "num_prompt_tokens": num_prompt_tokens,
+        "num_prompt_tokens": actual_prompt_tokens,  # Use actual, not estimate
         "num_output_tokens": num_output_tokens,
+        "total_tokens_generated": total_tokens_generated,
         "output_text": output_text,
     }
 
