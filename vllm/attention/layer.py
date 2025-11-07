@@ -366,7 +366,6 @@ class Attention(nn.Module, AttentionLayerBase):
                 compression_ratio=cache_config.kv_compression_ratio,
                 num_sink_tokens=cache_config.kv_compression_num_sink_tokens,
                 num_recent_tokens=cache_config.kv_compression_num_recent_tokens,
-                block_size=block_size,
             )
             self.kv_compressor = KVCacheCompressor(compression_config)
 
@@ -1002,16 +1001,11 @@ def unified_attention(
         # KV Compression: Apply at attention layer (identifies tokens to evict)
         if actual_len is not None and self.kv_compressor.should_compress(actual_len):
             # Apply compression to KV cache
-            k_cache, v_cache, keep_mask, compression_info, attn_bias = self.kv_compressor.compress(
-                kv_cache[0], kv_cache[1], actual_len
+            _, _, keep_mask, compression_info = self.kv_compressor.compress(
+                kv_cache, kv_cache, actual_len
             )
             # Store the mask - it identifies which KV cache entries to keep
             self._compression_mask = keep_mask
-            # Store the attention bias for the backend to use
-            self._attn_bias = attn_bias
-            # Set the bias on the metadata for the backend to use
-            if attn_metadata is not None:
-                attn_metadata.set_attn_bias(attn_bias, self.attn_type)
             # Store compression info for potential block freeing
             self._compression_info = compression_info
             
@@ -1079,20 +1073,13 @@ def unified_attention_with_output(
         elif hasattr(attn_metadata, 'num_prefill_tokens'):
             seq_len = attn_metadata.num_prefill_tokens
         
-        actual_len = self.kv_compressor._actual_seq_len
-        
-        if actual_len is not None and self.kv_compressor.should_compress(actual_len):
+        if seq_len is not None and self.kv_compressor.should_compress(seq_len):
             # Apply compression to KV cache
-            _, _, keep_mask, compression_info, attn_bias = self.kv_compressor.compress(
-                kv_cache[0], kv_cache[1], seq_len
+            _, _, keep_mask, compression_info = self.kv_compressor.compress(
+                kv_cache, kv_cache, seq_len
             )
             # Store the mask for potential use by attention backend
             self._compression_mask = keep_mask
-            # Store the attention bias for the backend to use
-            self._attn_bias = attn_bias
-            # Set the bias on the metadata for the backend to use
-            if attn_metadata is not None:
-                attn_metadata.set_attn_bias(attn_bias, self.attn_type)
             # Store compression info for potential block freeing
             self._compression_info = compression_info
     

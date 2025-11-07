@@ -1549,30 +1549,54 @@ class Scheduler(SchedulerInterface):
         return sync_affected_req_ids
 
     def _handle_compression_info(self, compression_info: dict[str, "CompressionInfo"], scheduler_output: SchedulerOutput) -> None:
-        """Handle compression information from the model runner.
-
-        This method delegates the block freeing to the KVCacheManager, which
-        in turn delegates to the appropriate SingleTypeKVCacheManager. This
-        ensures that the internal state of the manager is updated correctly.
+        """Handle compression information and free blocks that are completely empty.
 
         Args:
-            compression_info: Dict mapping request IDs to compression information.
-            scheduler_output: The scheduler output to be sent to the worker.
+            compression_info: Dict mapping request IDs to compression information
         """
+        logger.info(f"Scheduler _handle_compression_info called with: {compression_info}")
         if not compression_info:
+            logger.info("No compression info provided")
             return
 
         for req_id, info in compression_info.items():
+            logger.info(f"Processing compression for req {req_id}: blocks_to_free={info.blocks_to_free}, evicted_tokens={info.evicted_tokens}")
             if info.blocks_to_free:
                 logger.info(
-                    f"Compression: Request {req_id} identified "
-                    f"{len(info.blocks_to_free)} blocks to free."
+                    f"Compression: Identified {len(info.blocks_to_free)} blocks for freeing "
+                    f"for request {req_id} (evicted {info.evicted_tokens} tokens, "
+                    f"{info.strategy} strategy)"
                 )
-                freed_block_ids = self.kv_cache_manager.free_compressed_blocks(
-                    req_id, info.blocks_to_free
-                )
-                if freed_block_ids:
-                    scheduler_output.freed_block_ids.update(freed_block_ids)
-                    logger.info(
-                        f"Freed {len(freed_block_ids)} blocks for request {req_id}."
-                    )
+
+                # Get the KVCacheBlock objects for the blocks to free
+                blocks_to_free = []
+                for block_id in info.blocks_to_free:
+                    logger.debug(f"Checking block {block_id}: valid range? {0 <= block_id < len(self.kv_cache_manager.block_pool.blocks)}")
+                    if 0 <= block_id < len(self.kv_cache_manager.block_pool.blocks):
+                        block = self.kv_cache_manager.block_pool.blocks[block_id]
+                        logger.debug(f"Block {block_id}: is_null={block.is_null}, ref_cnt={block.ref_cnt}")
+                        # Only free blocks that are not the null block and have ref_cnt > 0
+                        if not block.is_null and block.ref_cnt > 0:
+                            blocks_to_free.append(block)
+                            logger.debug(f"Added block {block_id} to free list")
+
+                logger.info(f"Found {len(blocks_to_free)} valid blocks to free out of {len(info.blocks_to_free)} requested")
+                if blocks_to_free:
+                    # Count how many blocks will actually be freed (those with ref_cnt == 1)
+                    blocks_to_be_freed = [block for block in blocks_to_free if block.ref_cnt == 1 and not block.is_null]
+                    freed_count = len(blocks_to_be_freed)
+                    
+                    # Free the blocks - this decreases ref_cnt and adds to free queue if ref_cnt == 0
+                    self.kv_cache_manager.block_pool.free_blocks(blocks_to_free)
+                    
+                    # Collect freed block IDs to send to worker for GPU memory zeroing
+                    freed_block_ids = {block.block_id for block in blocks_to_be_freed}
+                    if freed_block_ids:
+                        scheduler_output.freed_block_ids.update(freed_block_ids)
+                        logger.debug(f"Added {len(freed_block_ids)} freed block IDs to scheduler output")
+                    
+                    logger.info(f"Freed {freed_count} blocks from KV cache")
+                else:
+                    logger.info(f"No valid blocks found to free for request {req_id}")
+            else:
+                logger.info(f"No blocks to free for req {req_id}")

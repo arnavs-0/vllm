@@ -71,38 +71,30 @@ class StreamingVideoKVCacheManager(SingleTypeKVCacheManager):
         """
         Allocate new blocks for a request, capping at max_allowed_blocks.
         
-        This implements the streaming policy by refusing to allocate beyond
-        the sink + recent window size. The first allocation marks sink blocks,
-        then subsequent allocations are capped at the window size.
+        During prefill: Allow full allocation (let video frames load normally)
+        During generation: Cap at sink + recent window
         
-        IMPORTANT: This caps the TOTAL allocation at sink + recent blocks,
-        meaning even during prefill, we only allocate up to the cap. The
-        attention layer (V0 streaming_llm) handles masking if enabled, but
-        this V1 block manager just caps allocation.
-        
-        This creates O(1) memory usage for the entire sequence.
+        This creates O(1) memory usage during generation while preserving
+        full prefill accuracy.
         """
         req_blocks = self.req_to_blocks[request_id]
         num_required_blocks = cdiv(num_tokens, self.block_size)
         
-        # Calculate max allowed blocks (this is the cap)
-        max_allowed_blocks = self.num_sink_blocks + self.num_recent_blocks
+        # Check if this is initial prefill or generation
+        is_prefill = len(req_blocks) == 0
         
-        # Cap total allocation at max_allowed_blocks
-        # If num_tokens requires more blocks than the cap, we only allocate up to cap
-        total_blocks_needed = len(req_blocks) + num_required_blocks
-        if total_blocks_needed > max_allowed_blocks:
-            # Need to limit allocation
-            num_new_blocks = max_allowed_blocks - len(req_blocks)
-        else:
-            num_new_blocks = num_required_blocks
+        if not is_prefill:
+            # During generation: Cap at maximum allowed blocks (sink + recent)
+            max_allowed_blocks = self.num_sink_blocks + self.num_recent_blocks
+            num_required_blocks = min(num_required_blocks, max_allowed_blocks)
+        
+        num_new_blocks = num_required_blocks - len(req_blocks)
         
         if num_new_blocks <= 0:
-            # Already at or exceeding capacity
-            if len(req_blocks) >= max_allowed_blocks:
+            # Already at capacity - blocks are reused via attention masking
+            if not is_prefill:
                 logger.debug(
-                    f"🔴 Request {request_id} at capacity ({len(req_blocks)}/{max_allowed_blocks} blocks) - "
-                    f"cannot allocate {num_required_blocks} more blocks for {num_tokens} tokens"
+                    f"⚠️  Request {request_id} at capacity - reusing blocks (generation mode)"
                 )
             return []
         
@@ -113,23 +105,24 @@ class StreamingVideoKVCacheManager(SingleTypeKVCacheManager):
         # Track allocation order
         self.block_allocation_order[request_id].extend(new_blocks)
         
-        # Mark sink blocks on first allocation
-        if request_id not in self.sink_blocks:
+        # Mark sink blocks on first allocation (prefill)
+        if is_prefill:
             # First allocation - mark the first num_sink_blocks as sinks
             num_sink = min(self.num_sink_blocks, len(req_blocks))
             self.sink_blocks[request_id] = req_blocks[:num_sink]
             logger.info(
-                f"✅ Marked {num_sink} sink blocks for request {request_id} "
-                f"(allocated {len(req_blocks)}/{max_allowed_blocks} blocks)"
+                f"✅ Prefill: Allocated {len(req_blocks)} blocks for request {request_id}, "
+                f"marked {num_sink} as sink blocks"
             )
-        
-        # Log when we hit capacity
-        if len(req_blocks) >= max_allowed_blocks:
-            logger.info(
-                f"🎯 Reached maximum capacity ({max_allowed_blocks} blocks) for request {request_id}. "
-                f"Structure: {len(self.sink_blocks.get(request_id, []))} sink + {self.num_recent_blocks} recent blocks. "
-                f"Future allocations will be refused (blocks reused via attention masking)."
-            )
+        else:
+            # Generation: Check if we hit capacity
+            max_allowed_blocks = self.num_sink_blocks + self.num_recent_blocks
+            if len(req_blocks) >= max_allowed_blocks:
+                logger.info(
+                    f"🎯 Reached maximum capacity ({max_allowed_blocks} blocks) for request {request_id}. "
+                    f"Structure: {len(self.sink_blocks.get(request_id, []))} sink + {self.num_recent_blocks} recent. "
+                    f"Future tokens will reuse existing blocks (attention layer masks middle)."
+                )
         
         return new_blocks
     

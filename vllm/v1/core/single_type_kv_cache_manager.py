@@ -256,10 +256,6 @@ class SingleTypeKVCacheManager(ABC):
         """
         raise NotImplementedError
 
-    def free_compressed_blocks(self, req_id: str, blocks_to_free: set[int]) -> set[int]:
-        """Frees blocks identified by the compression algorithm."""
-        raise NotImplementedError
-
 
 class FullAttentionManager(SingleTypeKVCacheManager):
     @classmethod
@@ -315,13 +311,6 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             else:
                 break
         return num_common_blocks
-
-    def free_compressed_blocks(self, req_id: str, blocks_to_free: set[int]) -> set[int]:
-        """Frees blocks identified by the compression algorithm."""
-        req_blocks = self.req_to_blocks[req_id]
-        blocks_to_free_objs = [b for b in req_blocks if b.block_id in blocks_to_free]
-        self.block_pool.free_blocks(blocks_to_free_objs)
-        return {b.block_id for b in blocks_to_free_objs}
 
 
 class SlidingWindowManager(SingleTypeKVCacheManager):
@@ -431,11 +420,6 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         window in the future.
         """
         return 0
-
-    def free_compressed_blocks(self, req_id: str, blocks_to_free: set[int]) -> set[int]:
-        """Frees blocks identified by the compression algorithm."""
-        raise NotImplementedError(
-            "Block compression is not supported by SlidingWindowManager.")
 
 
 class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
@@ -562,10 +546,11 @@ class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
             blocks[i] = self._null_block
         self.block_pool.free_blocks(removed_blocks)
 
-    def free_compressed_blocks(self, req_id: str, blocks_to_free: set[int]) -> set[int]:
-        """Frees blocks identified by the compression algorithm."""
-        raise NotImplementedError(
-            "Block compression is not supported by ChunkedLocalAttentionManager.")
+    def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+        """
+        cascade attention is not supported by chunked local attention.
+        """
+        return 0
 
 
 class MambaManager(SingleTypeKVCacheManager):
@@ -616,11 +601,6 @@ class MambaManager(SingleTypeKVCacheManager):
         cascade attention is not supported by mamba
         """
         return 0
-
-    def free_compressed_blocks(self, req_id: str, blocks_to_free: set[int]) -> set[int]:
-        """Frees blocks identified by the compression algorithm."""
-        raise NotImplementedError(
-            "Block compression is not supported by MambaManager.")
 
     def get_num_blocks_to_allocate(
         self,
@@ -701,18 +681,13 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
         # for the entire decoding process, so no blocks should be skipped
         pass
 
-    def free_compressed_blocks(self, req_id: str, blocks_to_free: set[int]) -> set[int]:
-        """Frees blocks identified by the compression algorithm."""
-        raise NotImplementedError(
-            "Block compression is not supported by CrossAttentionManager.")
-
 
 spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
     FullAttentionSpec: FullAttentionManager,
     MLAAttentionSpec: FullAttentionManager,
     SlidingWindowSpec: SlidingWindowManager,
     ChunkedLocalAttentionSpec: ChunkedLocalAttentionManager,
- MambaSpec: MambaManager,
+    MambaSpec: MambaManager,
     CrossAttentionSpec: CrossAttentionManager,
 }
 
@@ -727,17 +702,39 @@ def get_manager_for_kv_cache_spec(
     """
     Factory function to create the appropriate KV cache manager.
     
-    If compression is enabled for FullAttentionSpec, returns FullAttentionManager.
+    If compression is enabled for FullAttentionSpec, returns StreamingVideoKVCacheManager.
     Otherwise, returns the standard manager for the spec type.
     """
-    # If compression is enabled, we must use the FullAttentionManager.
-    # Other managers do not support it.
-    if enable_kv_compression:
-        manager_class = FullAttentionManager
-    else:
-        # Standard manager selection
-        manager_class = spec_manager_map[type(kv_cache_spec)]
-
+    # Check if we should use streaming video manager
+    if enable_kv_compression and isinstance(kv_cache_spec, FullAttentionSpec):
+        from vllm.v1.core.streaming_video_kv_cache_manager import StreamingVideoKVCacheManager
+        
+        # Convert token counts to block counts
+        block_size = kv_cache_spec.block_size
+        dcp_world_size = kwargs.get('dcp_world_size', 1)
+        if dcp_world_size > 1:
+            block_size *= dcp_world_size
+            
+        num_sink_blocks = max(1, kv_compression_num_sink_tokens // block_size)
+        num_recent_blocks = max(1, kv_compression_num_recent_tokens // block_size)
+        
+        # Extract required positional arguments from kwargs
+        block_pool = kwargs.pop('block_pool')
+        kv_cache_group_id = kwargs.pop('kv_cache_group_id')
+        dcp_world_size_arg = kwargs.pop('dcp_world_size', 1)
+        
+        manager = StreamingVideoKVCacheManager(
+            kv_cache_spec=kv_cache_spec,
+            block_pool=block_pool,
+            kv_cache_group_id=kv_cache_group_id,
+            dcp_world_size=dcp_world_size_arg,
+            num_sink_blocks=num_sink_blocks,
+            num_recent_blocks=num_recent_blocks,
+        )
+        return manager
+    
+    # Standard manager selection
+    manager_class = spec_manager_map[type(kv_cache_spec)]
     manager = manager_class(kv_cache_spec, **kwargs)
     return manager
 

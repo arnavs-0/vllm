@@ -167,13 +167,6 @@ class KVCacheCoordinator(ABC):
         for manager in self.single_type_managers:
             manager.free(request_id)
 
-    def free_compressed_blocks(self, req_id: str, blocks_to_free: set[int]) -> set[int]:
-        """Frees blocks identified by the compression algorithm."""
-        freed_blocks = set()
-        for manager in self.single_type_managers:
-            freed_blocks.update(manager.free_compressed_blocks(req_id, blocks_to_free))
-        return freed_blocks
-
     def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:
         """
         Get the number of common prefix blocks for all requests with allocated
