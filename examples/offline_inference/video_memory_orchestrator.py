@@ -340,13 +340,19 @@ class ZeroShotTextualizer:
 
 
 class VLLMClient:
-    def __init__(self, model: str, limit_mm_per_prompt: Optional[dict] = None):
+    def __init__(self, model: str, fps: float = 1.0, limit_mm_per_prompt: Optional[dict] = None):
         from vllm import LLM  # import lazily to keep CLI snappy
 
         self.llm = LLM(
             model=model,
             enforce_eager=True,
             limit_mm_per_prompt=limit_mm_per_prompt or {"video": 1},
+            max_num_batched_tokens=128000,
+            mm_processor_kwargs={
+                "min_pixels": 28 * 28,
+                "max_pixels": 1280 * 28 * 28,
+                "fps": fps,
+            },
         )
 
     def infer(
@@ -359,7 +365,9 @@ class VLLMClient:
         from vllm import SamplingParams
 
         sampling = SamplingParams(max_tokens=max_tokens, temperature=temperature)
-        inputs = {"prompt": prompt, "multi_modal_data": {"video": video_frames}}
+        # Stack frames into single video array: (num_frames, height, width, channels)
+        video_array = np.stack(video_frames, axis=0) if video_frames else np.empty((0, 224, 224, 3), dtype=np.uint8)
+        inputs = {"prompt": prompt, "multi_modal_data": {"video": video_array}}
 
         t0 = time.perf_counter()
         outputs = self.llm.generate([inputs], sampling_params=sampling)
@@ -392,7 +400,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
     )
     triggers = TriggerManager(trigger_cfg)
 
-    client = VLLMClient(model=args.model)
+    client = VLLMClient(model=args.model, fps=args.fps or 1.0)
     textualizer: Optional[ZeroShotTextualizer] = None
     if args.labels:
         try:
@@ -442,11 +450,14 @@ def run_orchestrator(args: argparse.Namespace) -> None:
             tags = textualizer.propose_tags(e_t, top_k=args.tag_top_k)
         snapshot_text = snapshot_to_text(long_vec, short_vec, tags)
 
-        # Prompt assembly
+        # Prompt assembly - Qwen2.5-VL format
         summary_prefix = ("\n".join(rolling_summary[-3:]) + "\n") if rolling_summary else ""
         prompt = (
-            f"{summary_prefix}SYSTEM:\n{snapshot_text}\n"
-            "USER: Describe what just happened in the recent video segment concisely. ASSISTANT:"
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+            f"<|im_start|>user\n<|vision_start|><|video_pad|><|vision_end|>"
+            f"{summary_prefix}{snapshot_text}\n"
+            "Describe what just happened in the recent video segment concisely.<|im_end|>\n"
+            "<|im_start|>assistant\n"
         )
 
         # Copy out a slice of recent frames as the video segment
