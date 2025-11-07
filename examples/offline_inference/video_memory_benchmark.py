@@ -106,9 +106,13 @@ def run_benchmark(args: argparse.Namespace) -> None:
     segment_frames = sample_segment(args.video, args.fps, args.window_size)
     # Stack frames into single video array: (num_frames, height, width, channels)
     segment = np.stack(segment_frames, axis=0)
+    
+    # Qwen2.5-VL video prompt format
     prompt = (
-        "SYSTEM:\nPeriodic memory snapshot benchmark.\n\n"
-        "USER: Describe what just happened in the recent video segment concisely. ASSISTANT:"
+        "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+        "<|im_start|>user\n<|vision_start|><|video_pad|><|vision_end|>"
+        "Describe what just happened in the recent video segment concisely.<|im_end|>\n"
+        "<|im_start|>assistant\n"
     )
 
     # vLLM setup
@@ -119,6 +123,11 @@ def run_benchmark(args: argparse.Namespace) -> None:
         enforce_eager=True,
         limit_mm_per_prompt={"video": 1},
         max_num_batched_tokens=128000,
+        mm_processor_kwargs={
+            "min_pixels": 28 * 28,
+            "max_pixels": 1280 * 28 * 28,
+            "fps": args.fps or 1,
+        },
     )
     sampling = SamplingParams(max_tokens=args.max_tokens, temperature=args.temperature)
 
