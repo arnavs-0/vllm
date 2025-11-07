@@ -383,12 +383,13 @@ class VLLMClient:
 
 
 def run_orchestrator(args: argparse.Namespace) -> None:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Use CPU for memory modules to avoid GPU contention with vLLM
+    device = torch.device("cpu")
 
     # Video reader
     reader = VideoReader(args.video, target_fps=args.fps)
 
-    # Modules
+    # Modules - all on CPU to leave GPU for vLLM
     encoder = FrameEncoder(device=device, embed_dim=args.embed_dim).eval()
     short_mem = ShortWindowAttention(embed_dim=encoder.embed_dim, hidden_dim=256).to(device).eval()
     long_mem = LongTermSSM(embed_dim=encoder.embed_dim, state_dim=args.state_dim, alpha=args.alpha).to(device).eval()
