@@ -303,3 +303,7 @@ windo = "windo"
 
 [tool.uv]
 no-build-isolation-package = ["torch"]
+index-strategy = "unsafe-best-match"
+environments = [
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
