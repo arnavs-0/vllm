@@ -112,7 +112,12 @@ def run_benchmark(args: argparse.Namespace) -> None:
     # vLLM setup
     from vllm import LLM, SamplingParams
 
-    llm = LLM(model=args.model, enforce_eager=True, limit_mm_per_prompt={"video": 1})
+    llm = LLM(
+        model=args.model,
+        enforce_eager=True,
+        limit_mm_per_prompt={"video": 1},
+        max_num_batched_tokens=128000,
+    )
     sampling = SamplingParams(max_tokens=args.max_tokens, temperature=args.temperature)
 
     latencies: List[float] = []
