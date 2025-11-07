@@ -348,6 +348,12 @@ class KVCacheManager:
         """
         self.coordinator.free(request.request_id)
 
+    def free_compressed_blocks(self, req_id: str, blocks_to_free: set[int]) -> set[int]:
+        """Frees blocks identified by the compression algorithm."""
+        if not self.enable_caching:
+            return set()
+        return self.coordinator.free_compressed_blocks(req_id, blocks_to_free)
+
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
         flows to invalidate prefix caching after the weights are updated,

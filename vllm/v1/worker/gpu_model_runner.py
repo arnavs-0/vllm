@@ -4730,28 +4730,26 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 module._compression_info = None
         
         if all_compression_infos:
-            # For now, use the last compression info (most recent)
-            # In a full implementation, we'd need to aggregate across layers
-            info_dict = all_compression_infos[-1]  # Use the most recent compression
-            
+            # Aggregate the compression info from all layers
+            aggregated_info = {
+                "original_seq_len": all_compression_infos[0]["original_seq_len"],
+                "compressed_seq_len": all_compression_infos[0]["compressed_seq_len"],
+                "evicted_tokens": all_compression_infos[0]["evicted_tokens"],
+                "strategy": all_compression_infos[0]["strategy"],
+                "compression_count": all_compression_infos[0]["compression_count"],
+                "blocks_to_free": set(),
+            }
+            for info in all_compression_infos:
+                aggregated_info["blocks_to_free"].update(info["blocks_to_free"])
+
             # Convert dict to CompressionInfo object
-            compression_info = CompressionInfo(
-                original_seq_len=info_dict["original_seq_len"],
-                compressed_seq_len=info_dict["compressed_seq_len"],
-                evicted_tokens=info_dict["evicted_tokens"],
-                blocks_to_free=info_dict["blocks_to_free"],
-                strategy=info_dict["strategy"],
-                compression_count=info_dict["compression_count"],
-            )
+            compression_info = CompressionInfo(**aggregated_info)
             
-            # For now, associate compression with the first request
-            # In a full implementation, we'd need to track which request triggered compression
+            # Associate compression with all requests in the batch
             if self.input_batch.req_ids:
-                req_id = self.input_batch.req_ids[0]  # Simplified - use first request
-                compression_info_dict[req_id] = compression_info
-                logger.info(f"🗜️ Worker collected compression info for req {req_id}: {len(info_dict['blocks_to_free'])} blocks to free (from {len(all_compression_infos)} layers)")
-                # Clear the info after collecting
-                module._compression_info = None
+                for req_id in self.input_batch.req_ids:
+                    compression_info_dict[req_id] = compression_info
+                logger.info(f"🗜️ Worker collected compression info for batch: {len(aggregated_info['blocks_to_free'])} blocks to free (from {len(all_compression_infos)} layers)")
             else:
                 logger.warning("No request IDs in input batch, cannot associate compression info")
         

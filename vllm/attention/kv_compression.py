@@ -56,6 +56,7 @@ class KVCompressionConfig:
     # Video streaming specific
     enable_block_manager_integration: bool = True  # Use block-level freeing
     tokens_per_video_frame: int = 120  # Approximate tokens per video frame
+    block_size: int = 16
     
     def __post_init__(self):
         if self.strategy != CompressionStrategy.NONE:
@@ -77,6 +78,7 @@ class KVCacheCompressor:
     def __init__(self, config: KVCompressionConfig):
         self.config = config
         self.total_tokens_seen = 0
+        self.block_size = config.block_size
         
         # Use global tracker for sequence length (shared across all layers)
         # We use a simple key "default" for single-sequence tracking
@@ -240,13 +242,13 @@ class KVCacheCompressor:
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             return key_cache, value_cache, None, None
         if not self.should_compress(seq_len):
-            return key_cache, value_cache, None, None
+            return key_cache, value_cache, None, None, None
         
         # Generate keep mask
         if self.config.strategy == CompressionStrategy.STREAMING_LLM:
             _, _, keep_mask = self.compress_streaming_llm(key_cache, value_cache, seq_len)
         else:
-            return key_cache, value_cache, None, None
+            return key_cache, value_cache, None, None, None
         
         # Actually apply compression by zeroing out evicted positions
         # This works with vLLM's paged attention as it will ignore zero entries
@@ -256,10 +258,11 @@ class KVCacheCompressor:
             compression_info = self._apply_compression_mask(key_cache, value_cache, keep_mask, seq_len)
         except Exception as e:
             logger.warning(f"Failed to apply compression mask: {e}. Compression skipped.")
-            return key_cache, value_cache, None, None
-        
-        return key_cache, value_cache, keep_mask, compression_info
-    
+            return key_cache, value_cache, None, None, None
+
+        attn_bias = self.get_attention_bias(keep_mask, key_cache.device)
+        return key_cache, value_cache, keep_mask, compression_info, attn_bias
+
     def _apply_compression_mask(
         self,
         key_cache: torch.Tensor,
@@ -303,8 +306,7 @@ class KVCacheCompressor:
             # 2. Map token indices to block/position indices
             # 3. Zero out the appropriate entries
             
-            # Assuming block_size (typically 16 in vLLM)
-            block_size = 16  # vLLM default
+            block_size = self.block_size
             
             # Find evicted token indices
             evicted_indices = torch.where(evict_mask)[0]

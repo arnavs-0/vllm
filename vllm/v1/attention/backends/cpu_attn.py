@@ -673,6 +673,8 @@ class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
                 seq_lens, _ = attn_metadata.get_seq_lens(attn_type)
                 attn_masks = [None] * len(seq_lens)
             attn_metadata.set_attn_bias(attn_masks, attn_type)
+        elif not isinstance(attn_masks, list):
+            attn_masks = [attn_masks]
 
         query = query.movedim(0, query.dim() - 2)
         key = key.movedim(0, key.dim() - 2)
