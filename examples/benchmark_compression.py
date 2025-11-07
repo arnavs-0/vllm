@@ -45,6 +45,7 @@ import torch
 from pathlib import Path
 from vllm import LLM, SamplingParams
 from vllm.assets.video import VideoAsset
+from vllm.config.kv_events import KVEventsConfig
 
 # Disable TorchDynamo/Inductor for CPU to avoid compilation errors
 # Comment this out if running on GPU and want Inductor optimizations
@@ -193,7 +194,7 @@ def benchmark_model(
             "kv_compression_num_recent_tokens": num_recent_tokens,
         })
     
-    llm = LLM(**llm_kwargs)
+    llm = LLM(**llm_kwargs, kv_events_config=KVEventsConfig(enable_kv_cache_events=True))
     
     init_time = time.perf_counter() - init_start
     init_memory = get_memory_usage()
@@ -251,6 +252,11 @@ def benchmark_model(
     gen_end = time.perf_counter()
     total_gen_time = gen_end - gen_start
 
+    kv_cache_utilization = 0.0
+    if hasattr(llm.llm_engine.scheduler, 'last_scheduler_stats') and \
+       hasattr(llm.llm_engine.scheduler.last_scheduler_stats, 'kv_cache_usage'):
+        kv_cache_utilization = llm.llm_engine.scheduler.last_scheduler_stats.kv_cache_usage * 100
+
     # Get final memory usage
     final_memory = get_memory_usage()
 
@@ -298,6 +304,7 @@ def benchmark_model(
     print(f"   Input tokens (actual): {actual_prompt_tokens}")
     print(f"   Output tokens:        {num_output_tokens}")
     print(f"   Total tokens:         {total_tokens_generated}")
+    print(f"   KV Cache Utilization: {kv_cache_utilization:.2f}%")
     if enable_compression:
         print(f"   Compression config:   sink={num_sink_tokens}, recent={num_recent_tokens} (cap={num_sink_tokens + num_recent_tokens})")
         if total_tokens_generated > compression_threshold:
@@ -328,6 +335,7 @@ def benchmark_model(
         "num_prompt_tokens": actual_prompt_tokens,  # Use actual, not estimate
         "num_output_tokens": num_output_tokens,
         "total_tokens_generated": total_tokens_generated,
+        "kv_cache_utilization": kv_cache_utilization,
         "output_text": output_text,
     }
 
@@ -404,6 +412,13 @@ def compare_results(baseline, compressed):
             key_name = key.replace('_', ' ').title()
             print(f"{'Final ' + key_name:<30} {baseline_final_usage:.1f}{'':<9} "
                   f"{compressed_final_usage:.1f}{'':<9} {savings:+.1f}%")
+
+    print(f"\nKV CACHE UTILIZATION:")
+    print(f"{'Metric':<30} {'Baseline':<15} {'Compressed':<15} {'Savings':<15}")
+    print(f"{'-'*75}")
+    savings = baseline['kv_cache_utilization'] - compressed['kv_cache_utilization']
+    print(f"{'KV Cache Utilization':<30} {baseline['kv_cache_utilization']:.2f}%{'':<8} "
+          f"{compressed['kv_cache_utilization']:.2f}%{'':<8} {savings:+.2f}%")
 
     print(f"\n📝 OUTPUT QUALITY:")
     print(f"{'Metric':<30} {'Baseline':<15} {'Compressed':<15} {'Match':<15}")
