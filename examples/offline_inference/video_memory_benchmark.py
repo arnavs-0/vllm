@@ -103,7 +103,9 @@ def sample_segment(path: str, target_fps: float | None, window_size: int) -> Seq
 
 def run_benchmark(args: argparse.Namespace) -> None:
     # Prepare fixed segment and prompt
-    segment = sample_segment(args.video, args.fps, args.window_size)
+    segment_frames = sample_segment(args.video, args.fps, args.window_size)
+    # Stack frames into single video array: (num_frames, height, width, channels)
+    segment = np.stack(segment_frames, axis=0)
     prompt = (
         "SYSTEM:\nPeriodic memory snapshot benchmark.\n\n"
         "USER: Describe what just happened in the recent video segment concisely. ASSISTANT:"
