@@ -43,8 +43,6 @@ import math
 import os
 import time
 import torch
-import cv2
-import numpy as np
 from pathlib import Path
 from vllm import LLM, SamplingParams
 from vllm.assets.video import VideoAsset
@@ -67,42 +65,6 @@ try:
 except ImportError:
     HAS_TRACEMALLOC = False
     print("⚠️  tracemalloc not available - Python memory tracking disabled")
-
-
-def load_video_from_path(file_path: str):
-    """Load a video from a file path using OpenCV."""
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"Video file not found at: {file_path}")
-    
-    cap = cv2.VideoCapture(file_path)
-    if not cap.isOpened():
-        raise IOError(f"Could not open video file: {file_path}")
-        
-    frames = []
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        # OpenCV reads frames in BGR format, convert to RGB
-        frames.append(frame[:, :, ::-1])
-        
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    
-    cap.release()
-    
-    video_data = np.stack(frames)
-    metadata = {
-        "fps": fps,
-        "size": (width, height),
-        "duration": frame_count / fps if fps > 0 else 0,
-    }
-    
-    print(f"✓ Loaded video '{Path(file_path).name}': {frame_count} frames, {height}x{width} @ {fps:.1f} FPS")
-    
-    return video_data, metadata
 
 
 def get_memory_usage():
@@ -177,24 +139,19 @@ def get_gpu_memory_mb():
 
 
 def benchmark_model(
+    num_frames: int,
     max_tokens: int,
     enable_compression: bool,
     compression_threshold: int = 50,
     num_sink_tokens: int = 4,
     num_recent_tokens: int = 128,
-    video_file: str = None,
-    num_frames: int = 4,
 ):
     """Run benchmark for one configuration"""
 
     mode = "COMPRESSED" if enable_compression else "BASELINE"
     print(f"\n{'='*80}")
     print(f"🔬 BENCHMARKING: {mode}")
-    if video_file:
-        print(f"   Video: {Path(video_file).name}, Max tokens: {max_tokens}")
-    else:
-        print(f"   Frames: {num_frames}, Max tokens: {max_tokens}")
-        
+    print(f"   Frames: {num_frames}, Max tokens: {max_tokens}")
     if enable_compression:
         print(f"   Compression: threshold={compression_threshold}, "
               f"sink={num_sink_tokens}, recent={num_recent_tokens}")
@@ -214,19 +171,24 @@ def benchmark_model(
     # Measure model initialization time
     init_start = time.perf_counter()
     
+    # Get baseline memory BEFORE model initialization
+    baseline_memory = get_memory_usage()
+    
     llm_kwargs = {
         "model": "Qwen/Qwen2-VL-2B-Instruct",
-        "max_model_len": 37000,
-        "max_num_batched_tokens": 37000,
+        "max_model_len": 8192,
+        "max_num_batched_tokens": 8192,  # Must be >= max_model_len
         "max_num_seqs": 1,
         "limit_mm_per_prompt": {"image": 10, "video": 10},
         "gpu_memory_utilization": 0.95,
     }
     
     if enable_compression:
+        # Use V1 block manager compression ONLY (not V0 attention layer)
+        # This avoids dual compression overhead
         llm_kwargs.update({
             "enable_kv_compression": True,
-            "kv_compression_strategy": "none",
+            "kv_compression_strategy": "none",  # Disable V0 attention layer compression (streaming_llm)
             "kv_compression_max_tokens": compression_threshold,
             "kv_compression_num_sink_tokens": num_sink_tokens,
             "kv_compression_num_recent_tokens": num_recent_tokens,
@@ -240,12 +202,14 @@ def benchmark_model(
         model_config = llm.llm_engine.model_config
         cache_config = llm.llm_engine.cache_config
         
+        # For multi-modal models, the language model config is often nested
         hf_config = model_config.hf_config
         text_config = getattr(hf_config, 'text_config', hf_config)
 
         engine_config['block_size'] = cache_config.block_size
         engine_config['num_gpu_blocks'] = cache_config.num_gpu_blocks
         
+        # Calculate memory per block
         dtype_size = torch.tensor([], dtype=model_config.dtype).element_size()
         num_layers = text_config.num_hidden_layers
         num_heads = text_config.num_attention_heads
@@ -270,17 +234,14 @@ def benchmark_model(
     print(f"✓ Model initialized in {init_time:.2f}s")
     print_memory_usage(init_memory, "Initial Memory Usage")
 
-    # --- Load video data ---
+    # Load video using VideoAsset (same as working scripts)
     print("📹 Loading video frames...")
     process_start = time.perf_counter()
-    if video_file:
-        video, metadata = load_video_from_path(video_file)
-        num_frames = len(video)
-    else:
-        video = VideoAsset(name="baby_reading", num_frames=num_frames).np_ndarrays
-        metadata = VideoAsset(name="baby_reading", num_frames=num_frames).metadata
-    # -----------------------
 
+    video = VideoAsset(name="baby_reading", num_frames=num_frames).np_ndarrays
+    metadata = VideoAsset(name="baby_reading", num_frames=num_frames).metadata
+
+    # Create prompt (same format as working scripts)
     prompt = (
         "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
         "<|im_start|>user\n<|vision_start|><|video_pad|><|vision_end|>"
@@ -291,47 +252,64 @@ def benchmark_model(
     process_time = time.perf_counter() - process_start
     prefill_memory = get_memory_usage()
 
+    # Get approximate prompt token count (will be accurate after generation)
     tokenizer = llm.get_tokenizer()
-    # A rough approximation for logging. The actual value is calculated after generation.
-    approx_prompt_tokens = len(tokenizer.encode(prompt)) + (num_frames * 120)
+    num_prompt_tokens = len(tokenizer.encode(prompt)) + (num_frames * 120)  # Approx 120 tokens per frame
     print(f"✓ Video processed in {process_time:.2f}s")
-    print(f"✓ Prompt tokens (approx): {approx_prompt_tokens}")
+    print(f"✓ Prompt tokens (approx): {num_prompt_tokens}")
     print(f"✓ Compression threshold: {compression_threshold if enable_compression else 'N/A'}")
-    if enable_compression and approx_prompt_tokens > compression_threshold:
+    if enable_compression and num_prompt_tokens > compression_threshold:
         print(f"✓ Compression should trigger (prompt tokens > threshold)")
     elif enable_compression:
         print(f"⚠️  Compression may not trigger (prompt tokens <= threshold)")
     print_memory_usage(prefill_memory, "Memory After Prefill")
     
-    sampling_params = SamplingParams(temperature=0.0, max_tokens=max_tokens)
+    # Generate output
+    sampling_params = SamplingParams(
+        temperature=0.0,
+        max_tokens=max_tokens,
+    )
     
     print("🚀 Starting generation...")
     gen_start = time.perf_counter()
     
     outputs = llm.generate(
-        {"prompt": prompt, "multi_modal_data": {"video": [(video, metadata)]}},
+        {
+            "prompt": prompt,
+            "multi_modal_data": {"video": [(video, metadata)]},
+        },
         sampling_params=sampling_params,
     )
     
     gen_end = time.perf_counter()
     total_gen_time = gen_end - gen_start
 
+    # Get final memory usage
     final_memory = get_memory_usage()
 
     if HAS_TRACEMALLOC:
         tracemalloc.stop()
 
+    # Extract output
     output_text = outputs[0].outputs[0].text
     num_output_tokens = len(outputs[0].outputs[0].token_ids)
+    
+    # Get ACTUAL prompt token count from output metadata
     actual_prompt_tokens = len(outputs[0].prompt_token_ids)
     total_tokens_generated = actual_prompt_tokens + num_output_tokens
     
+    # Calculate metrics
     throughput = num_output_tokens / total_gen_time if total_gen_time > 0 else 0
     time_per_token_ms = (total_gen_time / num_output_tokens * 1000) if num_output_tokens > 0 else 0
 
+    # Estimate TTFT (first token time) - rough estimate
+    # In vLLM, TTFT includes prefill, so it's roughly total_time / num_tokens * initial_overhead
+    # For simplicity, we'll estimate it as the time before main generation
+    estimated_ttft = process_time + 0.1  # Rough estimate
+
     # --- Calculate blocks used based on algorithm rules ---
     num_blocks_used = 0
-    if 'block_size' in engine_config and engine_config['block_size'] > 0:
+    if 'block_size' in engine_config:
         block_size = engine_config['block_size']
         if not enable_compression:
             num_blocks_used = math.ceil(total_tokens_generated / block_size)
@@ -339,6 +317,7 @@ def benchmark_model(
             if total_tokens_generated <= compression_threshold:
                 num_blocks_used = math.ceil(total_tokens_generated / block_size)
             else:
+                # Replicate the logic from StreamingVideoKVCacheManager
                 num_sink_blocks = max(1, num_sink_tokens // block_size)
                 num_recent_blocks = max(1, num_recent_tokens // block_size)
                 num_blocks_used = num_sink_blocks + num_recent_blocks
@@ -348,18 +327,28 @@ def benchmark_model(
     print(f"📊 RESULTS - {mode}")
     print(f"{'='*80}")
     print(f"⏱️  TIMING:")
+    print(f"   Model init:           {init_time:.3f}s")
+    print(f"   Video processing:     {process_time:.3f}s")
     print(f"   Total generation:     {total_gen_time:.3f}s")
     print(f"   Time per token (avg): {time_per_token_ms:.1f}ms")
     print(f"   Throughput:           {throughput:.2f} tokens/s")
     print(f"\n💾 MEMORY:")
     print_memory_usage(final_memory, "Final Memory Usage")
 
+    # Show memory deltas
+    print(f"\n📈 MEMORY DELTAS (from baseline):")
+    for key in final_memory:
+        if key in baseline_memory:
+            delta = final_memory[key] - baseline_memory[key]
+            key_name = key.replace('_', ' ').title()
+            print(f"   {key_name}: {delta:+.1f} MB")
+
     print(f"\n📝 TOKENS:")
     print(f"   Input tokens (actual): {actual_prompt_tokens}")
     print(f"   Output tokens:        {num_output_tokens}")
     print(f"   Total tokens:         {total_tokens_generated}")
     if enable_compression:
-        print(f"   Compression config:   sink={num_sink_tokens}, recent={num_recent_tokens}")
+        print(f"   Compression config:   sink={num_sink_tokens}, recent={num_recent_tokens} (cap={num_sink_tokens + num_recent_tokens})")
         if total_tokens_generated > compression_threshold:
             print(f"   ✓ Compression TRIGGERED (total={total_tokens_generated} > threshold={compression_threshold})")
         else:
@@ -369,15 +358,25 @@ def benchmark_model(
     print(f"   {output_text}...")
     print(f"{'='*80}\n")
     
+    # Clean up LLM object to free GPU resources
     del llm
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     
     return {
         "mode": mode,
+        "init_time": init_time,
+        "process_time": process_time,
         "total_gen_time": total_gen_time,
         "time_per_token_ms": time_per_token_ms,
         "throughput": throughput,
+        "baseline_memory": baseline_memory,
+        "init_memory": init_memory,
+        "prefill_memory": prefill_memory,
+        "final_memory": final_memory,
+        "num_prompt_tokens": actual_prompt_tokens,
+        "num_output_tokens": num_output_tokens,
+        "total_tokens_generated": total_tokens_generated,
         "output_text": output_text,
         "engine_config": engine_config,
         "num_blocks_used": num_blocks_used,
@@ -392,6 +391,7 @@ def compare_results(baseline, compressed):
     print(f"{'='*80}\n")
 
     # --- High-Impact Analysis ---
+    # Check if engine_config was successfully populated in both runs
     if (baseline.get('engine_config') and compressed.get('engine_config') and 
         baseline.get('num_blocks_used') is not None and compressed.get('num_blocks_used') is not None 
         and baseline['num_blocks_used'] > 0 and compressed['num_blocks_used'] > 0):
@@ -429,26 +429,58 @@ def compare_results(baseline, compressed):
     print(f"{'Metric':<30} {'Baseline':<15} {'Compressed':<15} {'Speedup':<15}")
     print(f"{'-'*75}")
     
+    # Total generation time
     speedup = baseline['total_gen_time'] / compressed['total_gen_time'] if compressed['total_gen_time'] > 0 else 0
     print(f"{'Total generation time':<30} {baseline['total_gen_time']:.3f}s{'':<8} "
           f"{compressed['total_gen_time']:.3f}s{'':<8} {speedup:.2f}x")
     
+    # Time per token
     speedup = baseline['time_per_token_ms'] / compressed['time_per_token_ms'] if compressed['time_per_token_ms'] > 0 else 0
     print(f"{'Time per token':<30} {baseline['time_per_token_ms']:.1f}ms{'':<9} "
           f"{compressed['time_per_token_ms']:.1f}ms{'':<9} {speedup:.2f}x")
     
+    # Throughput
     improvement = (compressed['throughput'] / baseline['throughput'] - 1) * 100 if baseline['throughput'] > 0 else 0
     print(f"{'Throughput':<30} {baseline['throughput']:.2f} tok/s{'':<5} "
           f"{compressed['throughput']:.2f} tok/s{'':<5} {improvement:+.1f}%")
     
+    print(f"\n💾 MEMORY COMPARISON (PROCESS-LEVEL):")
+    print(f"{'Metric':<30} {'Baseline':<15} {'Compressed':<15} {'Savings':<15}")
+    print(f"{'-'*75}")
+    print(f"{'NOTE: Focus on Capacity Analysis above for KV cache memory.':<75}")
+    print(f"{'This section shows CPU/Python memory of the main process only.':<75}")
+    print(f"{'-'*75}")
+
+    # Compare peak memory usage (more relevant for compression)
+    print(f"{'PEAK MEMORY USAGE':<30} {'(MB)':<15} {'(MB)':<15} {'(%)':<15}")
+    peak_keys = ['cpu_rss', 'cpu_vms', 'python_peak']
+    for key in peak_keys:
+        if key in baseline['final_memory'] and key in compressed['final_memory']:
+            # Use prefill memory as baseline (after model loading, before generation)
+            baseline_prefill = baseline['prefill_memory'][key]
+            compressed_prefill = compressed['prefill_memory'][key]
+            baseline_peak = baseline['final_memory'][key]
+            compressed_peak = compressed['final_memory'][key]
+
+            # Calculate peak usage above prefill baseline
+            baseline_peak_usage = baseline_peak - baseline_prefill
+            compressed_peak_usage = compressed_peak - compressed_prefill
+
+            savings = (1 - compressed_peak_usage / baseline_peak_usage) * 100 if baseline_peak_usage > 0 else 0
+            key_name = key.replace('_', ' ').title()
+            print(f"{'Peak ' + key_name:<30} {baseline_peak_usage:.1f}{'':<9} "
+                  f"{compressed_peak_usage:.1f}{'':<9} {savings:+.1f}%")
+
     print(f"\n📝 OUTPUT QUALITY:")
     print(f"{'Metric':<30} {'Baseline':<15} {'Compressed':<15} {'Match':<15}")
     print(f"{'-'*75}")
 
+    # Output length
     match = "✓ Yes" if baseline['output_text'] == compressed['output_text'] else "✗ No"
     print(f"{'Output length (chars)':<30} {len(baseline['output_text']):<15} "
           f"{len(compressed['output_text']):<15} {match}")
 
+    # Exact match
     if baseline['output_text'] == compressed['output_text']:
         print(f"\n✅ OUTPUTS ARE IDENTICAL - 100% match!")
     else:
@@ -457,11 +489,11 @@ def compare_results(baseline, compressed):
     print(f"\n{'='*80}\n")
 
 
+
 def main():
-    import gc
+    import gc  # Import gc for cleanup
     parser = argparse.ArgumentParser(description="Benchmark compression time and memory")
-    parser.add_argument("--video-file", type=str, default=None, help="Path to a local MP4 video file to process.")
-    parser.add_argument("--num-frames", type=int, default=4, help="Number of video frames (used if --video-file is not provided).")
+    parser.add_argument("--num-frames", type=int, default=4, help="Number of video frames")
     parser.add_argument("--max-tokens", type=int, default=100, help="Max tokens to generate")
     parser.add_argument("--threshold", type=int, default=5000, help="Compression threshold (tokens before compression triggers)")
     parser.add_argument("--num-sink", type=int, default=4, help="Number of sink tokens")
@@ -473,33 +505,34 @@ def main():
     
     results = {}
     
-    common_args = {
-        "max_tokens": args.max_tokens,
-        "video_file": args.video_file,
-        "num_frames": args.num_frames,
-    }
-    
+    # Run baseline
     if not args.compressed_only:
         print("\n" + "="*80)
         print("🔵 RUNNING BASELINE (NO COMPRESSION)")
         print("="*80)
         baseline_result = benchmark_model(
-            **common_args,
+            num_frames=args.num_frames,
+            max_tokens=args.max_tokens,
             enable_compression=False,
         )
         results['baseline'] = baseline_result
         
+        # Clean up GPU resources before next test
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
+        
+        # Wait a bit between runs
         time.sleep(2)
     
+    # Run compressed
     if not args.baseline_only:
         print("\n" + "="*80)
         print("🟢 RUNNING COMPRESSED")
         print("="*80)
         compressed_result = benchmark_model(
-            **common_args,
+            num_frames=args.num_frames,
+            max_tokens=args.max_tokens,
             enable_compression=True,
             compression_threshold=args.threshold,
             num_sink_tokens=args.num_sink,
@@ -507,10 +540,12 @@ def main():
         )
         results['compressed'] = compressed_result
         
+        # Clean up GPU resources after compressed test
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
     
+    # Compare results
     if 'baseline' in results and 'compressed' in results:
         compare_results(results['baseline'], results['compressed'])
 
