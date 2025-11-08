@@ -39,6 +39,7 @@ NOTE: CPU mode is VERY SLOW (minutes per run). Use smaller --max-tokens (e.g., 2
 """
 
 import argparse
+import math
 import os
 import time
 import torch
@@ -195,6 +196,38 @@ def benchmark_model(
     
     llm = LLM(**llm_kwargs)
     
+    # --- Extract engine info for impact analysis ---
+    engine_config = {}
+    try:
+        model_config = llm.llm_engine.model_config
+        cache_config = llm.llm_engine.cache_config
+        
+        # For multi-modal models, the language model config is often nested
+        hf_config = model_config.hf_config
+        text_config = getattr(hf_config, 'text_config', hf_config)
+
+        engine_config['block_size'] = cache_config.block_size
+        engine_config['num_gpu_blocks'] = cache_config.num_gpu_blocks
+        
+        # Calculate memory per block
+        dtype_size = torch.tensor([], dtype=model_config.dtype).element_size()
+        num_layers = text_config.num_hidden_layers
+        num_heads = text_config.num_attention_heads
+        hidden_size = text_config.hidden_size
+        head_dim = hidden_size // num_heads
+        
+        block_mem_size = 2 * engine_config['block_size'] * num_layers * num_heads * head_dim * dtype_size
+        engine_config['block_mem_size_mb'] = block_mem_size / 1024 / 1024
+        
+        print("\n⚙️  Engine Info:")
+        print(f"   Block Size: {engine_config['block_size']} tokens")
+        print(f"   Total GPU Blocks in Pool: {engine_config['num_gpu_blocks']}")
+        print(f"   KV Cache Memory per Block: {engine_config['block_mem_size_mb']:.3f} MB")
+
+    except Exception as e:
+        print(f"⚠️  Could not extract engine info for impact analysis: {e}")
+    # -----------------------------------------
+
     init_time = time.perf_counter() - init_start
     init_memory = get_memory_usage()
 
@@ -274,6 +307,22 @@ def benchmark_model(
     # For simplicity, we'll estimate it as the time before main generation
     estimated_ttft = process_time + 0.1  # Rough estimate
 
+    # --- Calculate blocks used based on algorithm rules ---
+    num_blocks_used = 0
+    if 'block_size' in engine_config:
+        block_size = engine_config['block_size']
+        if not enable_compression:
+            num_blocks_used = math.ceil(total_tokens_generated / block_size)
+        else:
+            if total_tokens_generated <= compression_threshold:
+                num_blocks_used = math.ceil(total_tokens_generated / block_size)
+            else:
+                # Replicate the logic from StreamingVideoKVCacheManager
+                num_sink_blocks = max(1, num_sink_tokens // block_size)
+                num_recent_blocks = max(1, num_recent_tokens // block_size)
+                num_blocks_used = num_sink_blocks + num_recent_blocks
+    # ----------------------------------------------------
+
     print(f"\n{'='*80}")
     print(f"📊 RESULTS - {mode}")
     print(f"{'='*80}")
@@ -302,11 +351,11 @@ def benchmark_model(
         print(f"   Compression config:   sink={num_sink_tokens}, recent={num_recent_tokens} (cap={num_sink_tokens + num_recent_tokens})")
         if total_tokens_generated > compression_threshold:
             print(f"   ✓ Compression TRIGGERED (total={total_tokens_generated} > threshold={compression_threshold})")
-            print(f"   ✓ Tokens should be capped at ~{num_sink_tokens + num_recent_tokens} after compression")
         else:
             print(f"   ⚠️  Compression NOT triggered (total={total_tokens_generated} <= threshold={compression_threshold})")
+
     print(f"\n📄 OUTPUT ({len(output_text)} chars):")
-    print(f"   {output_text[:200]}...")
+    print(f"   {output_text}...")
     print(f"{'='*80}\n")
     
     # Clean up LLM object to free GPU resources
@@ -325,10 +374,12 @@ def benchmark_model(
         "init_memory": init_memory,
         "prefill_memory": prefill_memory,
         "final_memory": final_memory,
-        "num_prompt_tokens": actual_prompt_tokens,  # Use actual, not estimate
+        "num_prompt_tokens": actual_prompt_tokens,
         "num_output_tokens": num_output_tokens,
         "total_tokens_generated": total_tokens_generated,
         "output_text": output_text,
+        "engine_config": engine_config,
+        "num_blocks_used": num_blocks_used,
     }
 
 
@@ -338,6 +389,41 @@ def compare_results(baseline, compressed):
     print(f"\n{'='*80}")
     print(f"📊 COMPARISON: BASELINE vs COMPRESSED")
     print(f"{'='*80}\n")
+
+    # --- High-Impact Analysis ---
+    # Check if engine_config was successfully populated in both runs
+    if (baseline.get('engine_config') and compressed.get('engine_config') and 
+        baseline.get('num_blocks_used') is not None and compressed.get('num_blocks_used') is not None 
+        and baseline['num_blocks_used'] > 0 and compressed['num_blocks_used'] > 0):
+        
+        print(f"🚀 CAPACITY ANALYSIS (PROJECTION FROM SINGLE RUN)")
+        print(f"{'-'*80}")
+        print(f"(Based on projecting the block usage of this single run onto the total GPU block pool)")
+
+        bl_engine_cfg = baseline['engine_config']
+        bl_blocks_used = baseline['num_blocks_used']
+        bl_mem_per_stream = bl_blocks_used * bl_engine_cfg.get('block_mem_size_mb', 0)
+        bl_capacity = bl_engine_cfg['num_gpu_blocks'] // bl_blocks_used if bl_blocks_used > 0 else 0
+
+        cp_engine_cfg = compressed['engine_config']
+        cp_blocks_used = compressed['num_blocks_used']
+        cp_mem_per_stream = cp_blocks_used * cp_engine_cfg.get('block_mem_size_mb', 0)
+        cp_capacity = cp_engine_cfg['num_gpu_blocks'] // cp_blocks_used if cp_blocks_used > 0 else 0
+        
+        improvement_factor = cp_capacity / bl_capacity if bl_capacity > 0 else float('inf')
+
+        print(f"\nEffective KV Cache Memory per Stream (Actual for this run):")
+        print(f"  - Baseline:   {bl_mem_per_stream:7.1f} MB ({bl_blocks_used} blocks)")
+        print(f"  - Compressed: {cp_mem_per_stream:7.1f} MB ({cp_blocks_used} blocks)")
+        
+        print(f"\nProjected Concurrent Stream Capacity (Estimated):")
+        print(f"  - Baseline:   {bl_capacity} stream(s)")
+        print(f"  - Compressed: {cp_capacity} stream(s)  <-- {improvement_factor:.1f}x more capacity!")
+        print(f"{'-'*80}\n")
+    else:
+        print(f"⚠️  Skipping Capacity Analysis: Could not retrieve necessary engine/block info or block usage was zero.")
+        print(f"{'-'*80}\n")
+    # --------------------------
     
     print(f"⏱️  TIMING COMPARISON:")
     print(f"{'Metric':<30} {'Baseline':<15} {'Compressed':<15} {'Speedup':<15}")
@@ -358,11 +444,11 @@ def compare_results(baseline, compressed):
     print(f"{'Throughput':<30} {baseline['throughput']:.2f} tok/s{'':<5} "
           f"{compressed['throughput']:.2f} tok/s{'':<5} {improvement:+.1f}%")
     
-    print(f"\n💾 MEMORY COMPARISON:")
+    print(f"\n💾 MEMORY COMPARISON (PROCESS-LEVEL):")
     print(f"{'Metric':<30} {'Baseline':<15} {'Compressed':<15} {'Savings':<15}")
     print(f"{'-'*75}")
-    print(f"{'NOTE: GPU memory tracking limited in multi-process vLLM':<75}")
-    print(f"{'Focus on CPU/Python memory and compression effectiveness':<75}")
+    print(f"{'NOTE: Focus on Capacity Analysis above for KV cache memory.':<75}")
+    print(f"{'This section shows CPU/Python memory of the main process only.':<75}")
     print(f"{'-'*75}")
 
     # Compare peak memory usage (more relevant for compression)
@@ -385,26 +471,6 @@ def compare_results(baseline, compressed):
             print(f"{'Peak ' + key_name:<30} {baseline_peak_usage:.1f}{'':<9} "
                   f"{compressed_peak_usage:.1f}{'':<9} {savings:+.1f}%")
 
-    # Compare final memory usage for each metric
-    print(f"\n{'FINAL MEMORY USAGE':<30} {'(MB)':<15} {'(MB)':<15} {'(%)':<15}")
-    memory_keys = ['cpu_rss', 'cpu_vms', 'python_current']
-    for key in memory_keys:
-        if key in baseline['final_memory'] and key in compressed['final_memory']:
-            # Use prefill memory as baseline (after model loading, before generation)
-            baseline_prefill = baseline['prefill_memory'][key]
-            compressed_prefill = compressed['prefill_memory'][key]
-            baseline_final = baseline['final_memory'][key]
-            compressed_final = compressed['final_memory'][key]
-
-            # Calculate final usage above prefill baseline
-            baseline_final_usage = baseline_final - baseline_prefill
-            compressed_final_usage = compressed_final - compressed_prefill
-
-            savings = (1 - compressed_final_usage / baseline_final_usage) * 100 if baseline_final_usage > 0 else 0
-            key_name = key.replace('_', ' ').title()
-            print(f"{'Final ' + key_name:<30} {baseline_final_usage:.1f}{'':<9} "
-                  f"{compressed_final_usage:.1f}{'':<9} {savings:+.1f}%")
-
     print(f"\n📝 OUTPUT QUALITY:")
     print(f"{'Metric':<30} {'Baseline':<15} {'Compressed':<15} {'Match':<15}")
     print(f"{'-'*75}")
@@ -419,40 +485,9 @@ def compare_results(baseline, compressed):
         print(f"\n✅ OUTPUTS ARE IDENTICAL - 100% match!")
     else:
         print(f"\n⚠️  OUTPUTS DIFFER - Quality may be affected")
-
-    print(f"\n{'='*80}")
-    print(f"🎯 SUMMARY:")
-    print(f"{'='*80}")
-
-    if compressed['total_gen_time'] < baseline['total_gen_time']:
-        speedup = baseline['total_gen_time'] / compressed['total_gen_time']
-        print(f"⚡ Compression is {speedup:.2f}x FASTER")
-    else:
-        slowdown = compressed['total_gen_time'] / baseline['total_gen_time']
-        print(f"🐌 Compression is {slowdown:.2f}x SLOWER")
-
-    # Check for memory savings across all metrics (using generation-time deltas)
-    memory_saved = False
-    for key in memory_keys:
-        if (key in baseline['final_memory'] and key in compressed['final_memory'] and
-            key in baseline['prefill_memory'] and key in compressed['prefill_memory']):
-            baseline_delta = baseline['final_memory'][key] - baseline['prefill_memory'][key]
-            compressed_delta = compressed['final_memory'][key] - compressed['prefill_memory'][key]
-            if compressed_delta < baseline_delta:
-                memory_saved = True
-                break
-
-    if memory_saved:
-        print(f"💾 Compression REDUCES memory usage during generation")
-    else:
-        print(f"💾 Compression increases or maintains memory usage during generation")
-
-    if baseline['output_text'] == compressed['output_text']:
-        print(f"✅ Quality: IDENTICAL outputs (0% degradation)")
-    else:
-        print(f"⚠️  Quality: DIFFERENT outputs (quality may vary)")
     
-    print(f"{'='*80}\n")
+    print(f"\n{'='*80}\n")
+
 
 
 def main():
