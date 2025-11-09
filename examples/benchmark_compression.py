@@ -158,6 +158,7 @@ def benchmark_model(
 
     mode = "BASELINE"
     if enable_compression:
+        if compression_style not in COMPRESSION_DESC:
             raise ValueError(f"Unknown compression style: {compression_style}")
         mode = f"COMPRESSED ({compression_style.upper()})"
 
