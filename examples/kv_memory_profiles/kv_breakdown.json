@@ -1,0 +1,16 @@
+{
+  "dtype": "bfloat16",
+  "prompt_tokens": 329,
+  "generated_tokens": 32,
+  "kv_total_bytes": 0.0,
+  "kv_prompt_bytes": 0.0,
+  "kv_generated_bytes": 0.0,
+  "kv_block_bytes": 0,
+  "kv_total_blocks": 0,
+  "kv_usage_ratio": 0,
+  "kv_estimated_used_blocks": 0,
+  "kv_estimated_bytes_used": 0,
+  "kv_bytes_per_prompt_token": 0.0,
+  "kv_bytes_per_generated_token": 0.0,
+  "run_secs": 33.25476212496869
+}

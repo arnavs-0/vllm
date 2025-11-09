@@ -26,7 +26,8 @@ def test_compression():
     prompt = "Write a story: " + "word " * 100
     outputs = llm.generate([prompt], SamplingParams(max_tokens=10, temperature=0))
     
-    print(f"Generated output: {outputs[0].outputs[0].text[:50]}...")
+    # Print full generated output (no truncation)
+    print(f"Generated output: {outputs[0].outputs[0].text}")
     print(f"No crashes - compression hook is stable")
     
     # Clean up GPU resources before next test
@@ -53,7 +54,8 @@ def test_compression():
     long_prompt = "Write a story: " + "word " * 180  # This should create ~200 tokens
     outputs2 = llm2.generate([long_prompt], SamplingParams(max_tokens=10, temperature=0))
     
-    print(f"Generated output with compression: {outputs2[0].outputs[0].text[:50]}...")
+    # Print full generated output (no truncation)
+    print(f"Generated output with compression: {outputs2[0].outputs[0].text}")
     print(f"No crashes - compression pipeline works")
     
     # Test 3: Verify compression math (direct test)

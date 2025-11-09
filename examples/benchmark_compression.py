@@ -66,6 +66,13 @@ except ImportError:
     print("⚠️  tracemalloc not available - Python memory tracking disabled")
 
 
+COMPRESSION_DESC = {
+    "block": "Block-level streaming (V1 manager only, no attention masking)",
+    "streaming": "Attention-level streaming (V0 `streaming_llm` strategy)",
+    "hybrid": "Block manager + streaming attention for maximum eviction",
+}
+
+
 def get_memory_usage():
     """Get memory usage in MB for both CPU and GPU."""
     memory_info = {}
@@ -144,16 +151,32 @@ def benchmark_model(
     compression_threshold: int = 50,
     num_sink_tokens: int = 4,
     num_recent_tokens: int = 128,
+    compression_style: str = "block",
+    compression_ratio: float = 0.25,
 ):
     """Run benchmark for one configuration"""
 
-    mode = "COMPRESSED" if enable_compression else "BASELINE"
+    mode = "BASELINE"
+    if enable_compression:
+            raise ValueError(f"Unknown compression style: {compression_style}")
+        mode = f"COMPRESSED ({compression_style.upper()})"
+
+    active_sink_tokens = num_sink_tokens
+    active_recent_tokens = num_recent_tokens
     print(f"\n{'='*80}")
     print(f"🔬 BENCHMARKING: {mode}")
     print(f"   Frames: {num_frames}, Max tokens: {max_tokens}")
     if enable_compression:
-        print(f"   Compression: threshold={compression_threshold}, "
-              f"sink={num_sink_tokens}, recent={num_recent_tokens}")
+        capacity = num_sink_tokens + num_recent_tokens
+        desc = COMPRESSION_DESC[compression_style]
+        streaming_strategy = compression_style in {"streaming", "hybrid"}
+        print(f"   Compression style: {compression_style} - {desc}")
+        print(f"   Compression window: threshold={compression_threshold}, sink={num_sink_tokens}, "
+              f"recent={num_recent_tokens} (capacity={capacity})")
+        if streaming_strategy:
+            print(f"   Attention strategy: streaming_llm, ratio={compression_ratio:.2f}")
+        else:
+            print(f"   Attention strategy: none (V1 block manager only)")
     print(f"{'='*80}\n")
 
     # Clear GPU memory and start memory tracking BEFORE model loading
@@ -183,15 +206,29 @@ def benchmark_model(
     }
     
     if enable_compression:
-        # Use V1 block manager compression ONLY (not V0 attention layer)
-        # This avoids dual compression overhead
-        llm_kwargs.update({
+        # Configure KV compression according to the selected style.
+        compression_kwargs = {
             "enable_kv_compression": True,
-            "kv_compression_strategy": "none",  # Disable V0 attention layer compression (streaming_llm)
             "kv_compression_max_tokens": compression_threshold,
             "kv_compression_num_sink_tokens": num_sink_tokens,
             "kv_compression_num_recent_tokens": num_recent_tokens,
-        })
+        }
+
+        if compression_style == "block":
+            compression_kwargs["kv_compression_strategy"] = "none"
+        else:
+            compression_kwargs.update({
+                "kv_compression_strategy": "streaming_llm",
+                "kv_compression_ratio": compression_ratio,
+            })
+            if compression_style == "hybrid":
+                # Hybrid mode ensures a slightly larger retention window for block manager.
+                compression_kwargs["kv_compression_num_sink_tokens"] = max(num_sink_tokens, 4)
+                compression_kwargs["kv_compression_num_recent_tokens"] = max(num_recent_tokens, 128)
+
+        active_sink_tokens = compression_kwargs["kv_compression_num_sink_tokens"]
+        active_recent_tokens = compression_kwargs["kv_compression_num_recent_tokens"]
+        llm_kwargs.update(compression_kwargs)
     
     llm = LLM(**llm_kwargs)
     
@@ -224,11 +261,16 @@ def benchmark_model(
     num_prompt_tokens = len(tokenizer.encode(prompt)) + (num_frames * 120)  # Approx 120 tokens per frame
     print(f"✓ Video processed in {process_time:.2f}s")
     print(f"✓ Prompt tokens (approx): {num_prompt_tokens}")
-    print(f"✓ Compression threshold: {compression_threshold if enable_compression else 'N/A'}")
-    if enable_compression and num_prompt_tokens > compression_threshold:
-        print(f"✓ Compression should trigger (prompt tokens > threshold)")
-    elif enable_compression:
-        print(f"⚠️  Compression may not trigger (prompt tokens <= threshold)")
+    if enable_compression:
+        capacity = active_sink_tokens + active_recent_tokens
+        print(f"✓ Compression threshold: {compression_threshold} "
+              f"(capacity={capacity} tokens: sink={active_sink_tokens}, recent={active_recent_tokens})")
+        if compression_style in {"streaming", "hybrid"}:
+            print(f"   Attention ratio target: {compression_ratio:.2f}")
+        if num_prompt_tokens > compression_threshold:
+            print(f"✓ Compression should trigger (prompt tokens > threshold)")
+        else:
+            print(f"⚠️  Compression may not trigger (prompt tokens <= threshold)")
     print_memory_usage(prefill_memory, "Memory After Prefill")
     
     # Generate output
@@ -299,15 +341,19 @@ def benchmark_model(
     print(f"   Output tokens:        {num_output_tokens}")
     print(f"   Total tokens:         {total_tokens_generated}")
     if enable_compression:
-        print(f"   Compression config:   sink={num_sink_tokens}, recent={num_recent_tokens} (cap={num_sink_tokens + num_recent_tokens})")
+        capacity = active_sink_tokens + active_recent_tokens
+        print(f"   Compression config:   style={compression_style}, "
+              f"sink={active_sink_tokens}, recent={active_recent_tokens} (cap={capacity})")
+        if compression_style in {"streaming", "hybrid"}:
+            print(f"   Attention ratio target: {compression_ratio:.2f}")
         if total_tokens_generated > compression_threshold:
             print(f"   ✓ Compression TRIGGERED (total={total_tokens_generated} > threshold={compression_threshold})")
-            print(f"   ✓ Tokens should be capped at ~{num_sink_tokens + num_recent_tokens} after compression")
+            print(f"   ✓ Tokens should be capped at ~{capacity} after compression")
         else:
             print(f"   ⚠️  Compression NOT triggered (total={total_tokens_generated} <= threshold={compression_threshold})")
     print(f"\n📄 OUTPUT ({len(output_text)} chars):")
-    print(f"   {output_text[:200]}...")
-    print(f"{'='*80}\n")
+    # Print the full output text (no truncation)
+    print(f"   {output_text}")
     
     # Clean up LLM object to free GPU resources
     del llm
@@ -329,6 +375,11 @@ def benchmark_model(
         "num_output_tokens": num_output_tokens,
         "total_tokens_generated": total_tokens_generated,
         "output_text": output_text,
+        "compression_style": compression_style if enable_compression else None,
+        "compression_capacity": (active_sink_tokens + active_recent_tokens) if enable_compression else None,
+        "compression_ratio": (compression_ratio
+                              if enable_compression and compression_style in {"streaming", "hybrid"} else None),
+        "compression_triggered": enable_compression and total_tokens_generated > compression_threshold,
     }
 
 
@@ -338,6 +389,20 @@ def compare_results(baseline, compressed):
     print(f"\n{'='*80}")
     print(f"📊 COMPARISON: BASELINE vs COMPRESSED")
     print(f"{'='*80}\n")
+    compression_style = compressed.get("compression_style")
+    if compression_style:
+        desc = COMPRESSION_DESC.get(compression_style, "")
+        print(f"Compression style: {compression_style} - {desc}")
+        capacity = compressed.get("compression_capacity")
+        if capacity is not None:
+            print(f"Compression capacity (sink + recent): {capacity} tokens")
+        ratio = compressed.get("compression_ratio")
+        if ratio is not None:
+            print(f"Attention compression ratio target: {ratio:.2f}")
+        triggered = compressed.get("compression_triggered")
+        triggered_label = "yes" if triggered else "no"
+        print(f"Compression triggered: {triggered_label}")
+        print()
     
     print(f"⏱️  TIMING COMPARISON:")
     print(f"{'Metric':<30} {'Baseline':<15} {'Compressed':<15} {'Speedup':<15}")
@@ -458,11 +523,15 @@ def compare_results(baseline, compressed):
 def main():
     import gc  # Import gc for cleanup
     parser = argparse.ArgumentParser(description="Benchmark compression time and memory")
-    parser.add_argument("--num-frames", type=int, default=4, help="Number of video frames")
-    parser.add_argument("--max-tokens", type=int, default=100, help="Max tokens to generate")
-    parser.add_argument("--threshold", type=int, default=5000, help="Compression threshold (tokens before compression triggers)")
+    parser.add_argument("--num-frames", type=int, default=8, help="Number of video frames")
+    parser.add_argument("--max-tokens", type=int, default=200, help="Max tokens to generate")
+    parser.add_argument("--threshold", type=int, default=256, help="Compression threshold (tokens before compression triggers)")
     parser.add_argument("--num-sink", type=int, default=4, help="Number of sink tokens")
     parser.add_argument("--num-recent", type=int, default=128, help="Number of recent tokens")
+    parser.add_argument("--compression-style", choices=list(COMPRESSION_DESC.keys()), default="hybrid",
+                        help="Compression coordination strategy to benchmark")
+    parser.add_argument("--compression-ratio", type=float, default=0.25,
+                        help="Attention-compression ratio (streaming/hybrid only)")
     parser.add_argument("--baseline-only", action="store_true", help="Run only baseline")
     parser.add_argument("--compressed-only", action="store_true", help="Run only compressed")
     
@@ -502,6 +571,8 @@ def main():
             compression_threshold=args.threshold,
             num_sink_tokens=args.num_sink,
             num_recent_tokens=args.num_recent,
+            compression_style=args.compression_style,
+            compression_ratio=args.compression_ratio,
         )
         results['compressed'] = compressed_result
         
