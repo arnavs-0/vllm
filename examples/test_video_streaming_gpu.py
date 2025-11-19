@@ -121,6 +121,7 @@ def run_gpu_test():
         max_num_batched_tokens=max_num_batched_tokens,
         enable_prefix_caching=True,  # Enable for fair comparison
         enable_kv_compression=False,  # No compression
+        enforce_eager=True,           # Disable CUDA graphs for consistency
         gpu_memory_utilization=0.90,
         limit_mm_per_prompt={"image": 10, "video": 10},
     )
@@ -166,6 +167,7 @@ def run_gpu_test():
         max_num_batched_tokens=max_num_batched_tokens,
         enable_prefix_caching=True,  # CRITICAL: Enable prefix caching
         enable_kv_compression=True,   # Enable compression
+        enforce_eager=True,           # Disable CUDA graphs (incompatible with compression)
         gpu_memory_utilization=0.90,
         limit_mm_per_prompt={"image": 10, "video": 10},
     )
