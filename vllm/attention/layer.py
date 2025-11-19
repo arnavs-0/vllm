@@ -1064,24 +1064,45 @@ def unified_attention_with_output(
     
     # KV Cache Compression Hook
     if self.kv_compressor is not None:
-        # Try multiple ways to get sequence length
-        seq_len = None
-        if hasattr(attn_metadata, 'seq_lens') and len(attn_metadata.seq_lens) > 0:
-            seq_len = max(attn_metadata.seq_lens)
-        elif hasattr(attn_metadata, 'max_seq_len'):
-            seq_len = attn_metadata.max_seq_len
-        elif hasattr(attn_metadata, 'num_prefill_tokens'):
-            seq_len = attn_metadata.num_prefill_tokens
-        
-        if seq_len is not None and self.kv_compressor.should_compress(seq_len):
-            # Apply compression to KV cache
-            _, _, keep_mask, compression_info = self.kv_compressor.compress(
-                kv_cache, kv_cache, seq_len
-            )
-            # Store the mask for potential use by attention backend
-            self._compression_mask = keep_mask
-            # Store compression info for potential block freeing
-            self._compression_info = compression_info
+        # Skip compression during CUDA graph capture
+        # During capture, attn_metadata may not have the full structure
+        if torch.cuda.is_graph_capturing():
+            pass  # Skip compression during graph capture
+        else:
+            # Try multiple ways to get sequence length
+            seq_len = None
+            try:
+                if hasattr(attn_metadata, 'seq_lens'):
+                    seq_lens_list = attn_metadata.seq_lens
+                    if seq_lens_list is not None and len(seq_lens_list) > 0:
+                        seq_len = max(seq_lens_list)
+            except:
+                pass
+            
+            if seq_len is None:
+                try:
+                    if hasattr(attn_metadata, 'max_seq_len'):
+                        seq_len = attn_metadata.max_seq_len
+                except:
+                    pass
+            
+            if seq_len is None:
+                try:
+                    if hasattr(attn_metadata, 'num_prefill_tokens'):
+                        seq_len = attn_metadata.num_prefill_tokens
+                except:
+                    pass
+            
+            if seq_len is not None and self.kv_compressor.should_compress(seq_len):
+                # Apply compression to KV cache
+                _, _, keep_mask, compression_info = self.kv_compressor.compress(
+                    kv_cache, kv_cache, seq_len
+                )
+                # Store the mask for potential use by attention backend
+                self._compression_mask = keep_mask
+                # Store compression info for potential block freeing
+                self._compression_info = compression_info
+    
     
     self.impl.forward(
         self,
