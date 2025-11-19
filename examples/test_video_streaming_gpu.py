@@ -161,6 +161,8 @@ def run_gpu_test():
     torch.cuda.reset_peak_memory_stats()
     
     # Create ONE LLM instance for entire streaming session
+    # Use compression parameters that were proven to work in benchmark_compression.py:
+    # --num-sink 4, --num-recent 128
     llm_streaming = LLM(
         model=model_name,
         max_model_len=max_model_len,
@@ -170,6 +172,9 @@ def run_gpu_test():
         enforce_eager=True,           # Disable CUDA graphs (incompatible with compression)
         gpu_memory_utilization=0.90,
         limit_mm_per_prompt={"image": 10, "video": 10},
+        # Compression parameters (matching benchmark_compression.py working config)
+        kv_compression_num_sink_tokens=4,
+        kv_compression_num_recent_tokens=128,
     )
     
     print("✅ Single LLM instance created with compression + prefix caching enabled.\n")
