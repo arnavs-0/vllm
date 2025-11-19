@@ -1066,9 +1066,16 @@ def unified_attention_with_output(
     if self.kv_compressor is not None:
         # Skip compression during CUDA graph capture
         # During capture, attn_metadata may not have the full structure
-        if torch.cuda.is_graph_capturing():
-            pass  # Skip compression during graph capture
-        else:
+        is_capturing = False
+        try:
+            # Check if we're in CUDA graph capture mode
+            # This attribute may not exist in all PyTorch versions
+            if hasattr(torch.cuda, 'is_graph_capturing'):
+                is_capturing = torch.cuda.is_graph_capturing()
+        except:
+            pass
+        
+        if not is_capturing:
             # Try multiple ways to get sequence length
             seq_len = None
             try:
