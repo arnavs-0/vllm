@@ -242,6 +242,15 @@ Qwen2VLVideoInputs: TypeAlias = Qwen2VLVideoPixelInputs | Qwen2VLVideoEmbeddingI
 # === Vision Encoder === #
 
 
+def _pad_to_eight(x: torch.Tensor) -> torch.Tensor:
+    """Pad a tensor to a multiple of 8 for the FlashAttention kernel."""
+    pad_len = (8 - x.shape[-1] % 8) % 8
+    if pad_len == 0:
+        return x
+
+    return F.pad(x, (0, pad_len), "constant", 0)
+
+
 class Qwen2VisionMLP(nn.Module):
     def __init__(
         self,
@@ -444,6 +453,11 @@ class Qwen2VisionAttention(nn.Module):
 
         if self.is_flash_attn_backend:
             q, k, v = (rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
+
+            # Pad q, k, v to be a multiple of 8.
+            q = _pad_to_eight(q)
+            k = _pad_to_eight(k)
+            v = _pad_to_eight(v)
 
             output = self.flash_attn_varlen_func(
                 q,
