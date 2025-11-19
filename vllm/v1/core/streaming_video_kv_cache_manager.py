@@ -14,6 +14,7 @@ Based on StreamingLLM principles adapted for video frames.
 """
 
 from collections import defaultdict
+import itertools
 from collections.abc import Sequence
 from typing import Optional
 
@@ -194,10 +195,16 @@ class StreamingVideoKVCacheManager(SingleTypeKVCacheManager):
     
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """
-        For streaming video, common prefix is not applicable.
-        Each video stream is independent.
+        Get the number of common prefix blocks for all requests.
         """
-        return 0
+        blocks = self.req_to_blocks[running_request_id]
+        num_common_blocks = 0
+        for block in blocks:
+            if block.ref_cnt == len(self.req_to_blocks):
+                num_common_blocks += 1
+            else:
+                break
+        return num_common_blocks
     
     def remove_skipped_blocks(self, request_id: str, num_computed_tokens: int) -> None:
         """
@@ -264,12 +271,52 @@ class StreamingVideoKVCacheManager(SingleTypeKVCacheManager):
     ) -> tuple[list[KVCacheBlock], ...]:
         """
         Find longest prefix cache hit.
-        
-        For streaming video, we don't use prefix caching since we explicitly
-        manage block freeing. Return empty list (no cache hit).
         """
-        # No prefix caching for streaming video manager
-        return tuple([] for _ in kv_cache_group_ids)
+        computed_blocks: tuple[list[KVCacheBlock], ...] = tuple(
+            [] for _ in range(len(kv_cache_group_ids))
+        )
+        block_size = kv_cache_spec.block_size
+        if dcp_world_size > 1:
+            block_size *= dcp_world_size
+        max_num_blocks = max_length // block_size
+        for block_hash in itertools.islice(block_hashes, max_num_blocks):
+            # block_hashes is a chain of block hashes. If a block hash is not
+            # in the cached_block_hash_to_id, the following block hashes are
+            # not computed yet for sure.
+            if cached_block := block_pool.get_cached_block(
+                block_hash, kv_cache_group_ids
+            ):
+                for computed, cached in zip(computed_blocks, cached_block):
+                    computed.append(cached)
+            else:
+                break
+        if use_eagle and computed_blocks[0]:
+            for computed in computed_blocks:
+                computed.pop()
+        return computed_blocks
+
+    def save_new_computed_blocks(
+        self, request_id: str, new_computed_blocks: Sequence[KVCacheBlock]
+    ) -> None:
+        """
+        Add the new computed blocks to the request and update sink blocks if needed.
+        """
+        super().save_new_computed_blocks(request_id, new_computed_blocks)
+        
+        # If this is the first batch of blocks (prefill), identify sink blocks
+        # and track allocation order
+        req_blocks = self.req_to_blocks[request_id]
+        if new_computed_blocks:
+            # Add to allocation order for consistency
+            self.block_allocation_order[request_id].extend(new_computed_blocks)
+            
+            if request_id not in self.sink_blocks and req_blocks:
+                num_sink = min(self.num_sink_blocks, len(req_blocks))
+                self.sink_blocks[request_id] = req_blocks[:num_sink]
+                logger.info(
+                    f"✅ Cache Hit: Reused {len(new_computed_blocks)} blocks for request {request_id}, "
+                    f"marked {num_sink} as sink blocks"
+                )
 
     def remove_skipped_blocks(self, request_id: str, num_computed_tokens: int) -> None:
         """
