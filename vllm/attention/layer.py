@@ -964,36 +964,41 @@ def unified_attention(
             seq_len = attn_metadata.num_prefill_tokens
         
         # Track actual sequence length by inferring from previous state
-        # On first call (prefill), _actual_seq_len is None and seq_len is available
-        # On subsequent calls (decode), seq_len may be None but we increment based on previous state
+        # CRITICAL FIX: Reset state when starting a NEW prefill (different video length)
+        # This happens when seq_len is available AND significantly different from tracked length
         
-        if self.kv_compressor._actual_seq_len is None:
-            # First time seeing this sequence - need seq_len from metadata
-            if seq_len is not None and seq_len > 0:
+        if seq_len is not None:
+            # Check if this is a new prefill (seq_len available means we're in prefill phase)
+            if self.kv_compressor._actual_seq_len is None:
+                # First time initialization
                 self.kv_compressor._actual_seq_len = seq_len
                 if layer_name == "language_model.layers.0.self_attn.attn":
-                    logger.info(f"Prefill: initializing seq_len={seq_len}")
+                    logger.info(f"Compression: Initializing seq_len={seq_len}")
+            elif abs(seq_len - self.kv_compressor._actual_seq_len) > 10:
+                # seq_len differs significantly from tracked length
+                # This means we're starting a NEW request with different video length
+                # Reset compression state to avoid corruption
+                self.kv_compressor._actual_seq_len = seq_len
+                if layer_name == "language_model.layers.0.self_attn.attn":
+                    logger.info(f"Compression: NEW REQUEST detected, resetting seq_len={seq_len}")
         else:
-            # Already initialized - this is a decode step
-            # Increment sequence length regardless of whether metadata has seq_len
-            # Only increment ONCE per forward batch (not once per layer!)
-            from vllm.attention.kv_compression import _global_forward_call_counter
-            
-            counter_key = f"{self.kv_compressor._seq_tracker_key}_forward_count"
-            if counter_key not in _global_forward_call_counter:
-                _global_forward_call_counter[counter_key] = 0
-            
-            current_count = _global_forward_call_counter[counter_key]
-            
-            # Increment the counter for this forward pass
-            _global_forward_call_counter[counter_key] += 1
-            
-            # Only increment seq_len on the FIRST layer (layer 0)
-            # This ensures we increment once per token, not once per layer
-            if layer_name == "language_model.layers.0.self_attn.attn":
-                old_len = self.kv_compressor._actual_seq_len
-                self.kv_compressor._actual_seq_len += 1
-                logger.info(f"Decode: {old_len} -> {self.kv_compressor._actual_seq_len} (metadata seq_len={seq_len}, forward_count={current_count})")
+            # seq_len not available (decode phase)
+            # Increment sequence length for each new token generated
+            if self.kv_compressor._actual_seq_len is not None:
+                from vllm.attention.kv_compression import _global_forward_call_counter
+                
+                counter_key = f"{self.kv_compressor._seq_tracker_key}_forward_count"
+                if counter_key not in _global_forward_call_counter:
+                    _global_forward_call_counter[counter_key] = 0
+                
+                current_count = _global_forward_call_counter[counter_key]
+                _global_forward_call_counter[counter_key] += 1
+                
+                # Only increment seq_len on the FIRST layer (layer 0)
+                if layer_name == "language_model.layers.0.self_attn.attn":
+                    old_len = self.kv_compressor._actual_seq_len
+                    self.kv_compressor._actual_seq_len += 1
+                    logger.info(f"Compression: Decode {old_len} -> {self.kv_compressor._actual_seq_len}")
         
         # Use the tracked sequence length for compression decisions
         actual_len = self.kv_compressor._actual_seq_len
@@ -1014,8 +1019,7 @@ def unified_attention(
                 kept_positions = torch.where(keep_mask)[0].tolist() if keep_mask is not None else []
                 if kept_positions:
                     logger.info(
-                        f"Attention using compressed cache: "
-                        f"{len(kept_positions)} positions kept "
+                        f"Compression: Keeping {len(kept_positions)} positions "
                         f"(first 5: {kept_positions[:5]}, last 5: {kept_positions[-5:]})"
                     )
             

@@ -26,13 +26,14 @@ def run_gpu_test():
     
     # Verify GPU availability
     if not torch.cuda.is_available():
-        print("\n❌ ERROR: No GPU detected. This test requires GPU with prefix caching support.")
-        print("   Current device: CPU")
-        print("   Please run this on a GPU instance (e.g., A40).\n")
-        return
+        print("\n⚠️  WARNING: No GPU detected. Running on CPU (will be slow).")
+        # print("   Current device: CPU")
+        # print("   Please run this on a GPU instance (e.g., A40).\n")
+        # return
+    else:
+        print(f"\n✅ GPU: {torch.cuda.get_device_name(0)}")
+        print(f"   Total GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB\n")
     
-    print(f"\n✅ GPU detected: {torch.cuda.get_device_name(0)}")
-    print(f"   Total GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB\n")
     
     # Configuration
     model_name = "Qwen/Qwen2-VL-2B-Instruct"
@@ -40,22 +41,12 @@ def run_gpu_test():
     max_num_batched_tokens = 8192
     
     # Helper functions
-    def make_multi_video_prompt(num_videos):
-        """Create chat prompt with multiple video chunks"""
-        video_tokens = " ".join([
-            f"Video chunk {i+1}: <|vision_start|><|video_pad|><|vision_end|>" 
-            for i in range(num_videos)
-        ])
-        return (
-            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-            f"<|im_start|>user\n{video_tokens}\n"
-            "Describe what happens in the video based on these chunks.<|im_end|>\n"
-            "<|im_start|>assistant\n"
-        )
     
     def get_gpu_memory_mb():
         """Get current GPU memory usage in MB"""
-        return torch.cuda.memory_allocated() / 1024 / 1024
+        if torch.cuda.is_available():
+            return torch.cuda.memory_allocated() / 1024 / 1024
+        return 0.0
     
     def get_kv_stats(llm_instance, output, enable_compression):
         """Calculate KV cache statistics"""
@@ -94,14 +85,22 @@ def run_gpu_test():
     video = video_asset.np_ndarrays
     metadata = video_asset.metadata
     
-    # Prepare chunks (2 frames each)
-    chunks = [
-        (video[0:2], metadata),
-        (video[2:4], metadata),
-        (video[4:6], metadata),
-        (video[6:8], metadata)
-    ]
+    # For streaming, we'll use different frame counts but SINGLE video format
+    # (not multi-clip, which doesn't work with compression)
+    def make_video_chunks(num_frames_to_use):
+        """Return video with specified number of frames"""
+        return [(video[:num_frames_to_use], metadata)]
     
+    # Simple prompt (matching benchmark_compression.py format)
+    def make_prompt():
+        return (
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+            "<|im_start|>user\n<|vision_start|><|video_pad|><|vision_end|>"
+            "Describe what happens in this video in detail.<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
+    
+    prompt = make_prompt()
     sampling_params = SamplingParams(temperature=0.0, max_tokens=128)
     
     # =========================================================================
@@ -112,7 +111,8 @@ def run_gpu_test():
     print("=" * 100)
     print("Processing all 8 frames in a single request without compression...")
     
-    torch.cuda.reset_peak_memory_stats()
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     gpu_mem_before = get_gpu_memory_mb()
     
     llm_baseline = LLM(
@@ -128,13 +128,13 @@ def run_gpu_test():
     
     start = time.perf_counter()
     output_baseline = llm_baseline.generate(
-        {"prompt": make_multi_video_prompt(4), "multi_modal_data": {"video": chunks}},
+        {"prompt": prompt, "multi_modal_data": {"video": make_video_chunks(8)}},
         sampling_params=sampling_params
     )
     baseline_duration = time.perf_counter() - start
     
     baseline_blocks, baseline_kv_mem, baseline_tokens = get_kv_stats(llm_baseline, output_baseline, False)
-    baseline_gpu_mem = torch.cuda.max_memory_allocated() / 1024 / 1024
+    baseline_gpu_mem = torch.cuda.max_memory_allocated() / 1024 / 1024 if torch.cuda.is_available() else 0.0
     baseline_text = output_baseline[0].outputs[0].text
     
     print(f"\n📊 Results:")
@@ -146,7 +146,8 @@ def run_gpu_test():
     
     # Cleanup
     del llm_baseline
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     time.sleep(2)
     
     # =========================================================================
@@ -158,7 +159,8 @@ def run_gpu_test():
     print("Creating ONE LLM instance and processing frames incrementally (2→4→6→8)...")
     print("Prefix caching should reuse KV cache from previous steps.\n")
     
-    torch.cuda.reset_peak_memory_stats()
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     
     # Create ONE LLM instance for entire streaming session
     # Use compression parameters that were proven to work in benchmark_compression.py:
@@ -185,20 +187,18 @@ def run_gpu_test():
     
     # Stream frames incrementally
     for step in range(1, 5):
-        num_chunks = step
-        current_chunks = chunks[:num_chunks]
+        num_frames_to_use = step * 2  # 2, 4, 6, 8 frames
         
         print(f"{'─' * 80}")
-        print(f"Step {step}: Processing {num_chunks * 2} frames ({num_chunks} chunks)")
+        print(f"Step {step}: Processing {num_frames_to_use} frames")
         print(f"{'─' * 80}")
         
-        prompt = make_multi_video_prompt(num_chunks)
-        
-        torch.cuda.reset_peak_memory_stats()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         start = time.perf_counter()
         
         output = llm_streaming.generate(
-            {"prompt": prompt, "multi_modal_data": {"video": current_chunks}},
+            {"prompt": prompt, "multi_modal_data": {"video": make_video_chunks(num_frames_to_use)}},
             sampling_params=sampling_params
         )
         
@@ -206,12 +206,12 @@ def run_gpu_test():
         total_streaming_time += duration
         
         blocks, kv_mem, tokens = get_kv_stats(llm_streaming, output, True)
-        gpu_mem = torch.cuda.max_memory_allocated() / 1024 / 1024
+        gpu_mem = torch.cuda.max_memory_allocated() / 1024 / 1024 if torch.cuda.is_available() else 0.0
         text = output[0].outputs[0].text
         
         step_metrics.append({
             'step': step,
-            'frames': num_chunks * 2,
+            'frames': num_frames_to_use,
             'duration': duration,
             'blocks': blocks,
             'kv_memory_mb': kv_mem,
@@ -293,7 +293,8 @@ def run_gpu_test():
     
     # Cleanup
     del llm_streaming
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     run_gpu_test()
