@@ -170,9 +170,12 @@ def run_streaming_test(args):
             # Optional: Force garbage collection if memory is tight
             # import gc; gc.collect()
             
-    print("-" * 100)
+    print("-" * 110)
     print(f"Total Streaming Time: {total_time:.2f}s")
-    print("Done!")
+    if 'output_text' in locals():
+        print("\nFinal Step Output:")
+        print(output_text)
+    print("\nDone!")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
