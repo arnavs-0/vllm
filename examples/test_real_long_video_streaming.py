@@ -83,8 +83,8 @@ def run_streaming_test(args):
         # 48 frames exceeded 32k tokens.
         # We increase limit to 64k to accommodate the rolling window safely.
         max_model_len=65536,
-        max_num_batched_tokens=32768,
-        enable_chunked_prefill=True, # Enable chunking for large updates
+        max_num_batched_tokens=65536, # Allow full batch processing
+        enable_chunked_prefill=False, # DISABLE chunking to avoid compression loops
         enable_prefix_caching=True,
         enable_kv_compression=True,
         enforce_eager=True,
