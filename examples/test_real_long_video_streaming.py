@@ -78,8 +78,12 @@ def run_streaming_test(args):
     # Configuration
     llm = LLM(
         model=args.model,
-        max_model_len=10000,
-        max_num_batched_tokens=10000,
+        # Increase context limit to support VERY long videos.
+        # Qwen2-VL handles long context, and KV Compression keeps memory bounded.
+        # We set this high (128k) to avoid the "prompt too long" error.
+        max_model_len=128000,
+        max_num_batched_tokens=16384, # Limit batch size to avoid OOM
+        enable_chunked_prefill=True,  # Allow processing large prompts in chunks
         enable_prefix_caching=True,
         enable_kv_compression=True,
         enforce_eager=True,
@@ -105,15 +109,24 @@ def run_streaming_test(args):
     step = 0
     total_time = 0
     
+    # Rolling Window Configuration
+    # We keep the first 'sink_size' frames (context anchor)
+    # And the last 'window_size' frames (recent context)
+    sink_size = 4
+    window_size = args.chunk_size * 4 # Keep last 4 chunks as context
+    
     print("\nStarting Stream...")
-    print(f"{'Step':<6} | {'Frames':<8} | {'New Frames':<10} | {'Time (s)':<10} | {'FPS (Step)':<10} | {'Output':<40}")
-    print("-" * 100)
+    print(f"Strategy: Rolling Window (Sink: {sink_size} frames, Window: {window_size} frames)")
+    print(f"{'Step':<6} | {'Total Frames':<12} | {'Input Frames':<12} | {'Time (s)':<10} | {'FPS':<10} | {'Output':<40}")
+    print("-" * 110)
     
     current_chunk = []
+    all_frames_count = 0
     
     # Iterate through video frames
     for frame in frame_generator(args.video_path, args.max_frames):
         current_chunk.append(frame)
+        all_frames_count += 1
         
         if len(current_chunk) >= args.chunk_size:
             step += 1
@@ -122,10 +135,15 @@ def run_streaming_test(args):
             history_frames.extend(current_chunk)
             current_chunk = [] # Reset chunk
             
-            # Prepare inputs
-            # Note: We pass the FULL history. Prefix caching handles the optimization.
+            # Construct Input with Rolling Window
+            # 1. Sink Frames (Start of video)
+            if len(history_frames) > (sink_size + window_size):
+                input_frames = history_frames[:sink_size] + history_frames[-window_size:]
+            else:
+                input_frames = history_frames
+            
             # vLLM expects numpy array for video
-            video_input = np.array(history_frames)
+            video_input = np.array(input_frames)
             
             # Generate
             if torch.cuda.is_available():
@@ -147,7 +165,10 @@ def run_streaming_test(args):
             output_text = outputs[0].outputs[0].text.replace("\n", " ").strip()
             fps = args.chunk_size / duration
             
-            print(f"{step:<6} | {len(history_frames):<8} | {args.chunk_size:<10} | {duration:<10.2f} | {fps:<10.2f} | {output_text[:40]}...")
+            print(f"{step:<6} | {all_frames_count:<12} | {len(input_frames):<12} | {duration:<10.2f} | {fps:<10.2f} | {output_text[:40]}...")
+            
+            # Optional: Force garbage collection if memory is tight
+            # import gc; gc.collect()
             
     print("-" * 100)
     print(f"Total Streaming Time: {total_time:.2f}s")
