@@ -37,8 +37,8 @@ def run_gpu_test():
     
     # Configuration
     model_name = "Qwen/Qwen2-VL-2B-Instruct"
-    max_model_len = 8192
-    max_num_batched_tokens = 8192
+    max_model_len = 10000
+    max_num_batched_tokens = 10000
     
     # Helper functions
     
