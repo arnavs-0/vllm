@@ -80,7 +80,7 @@ def run_gpu_test():
             return 0, 0, 0
     
     # Load video
-    num_frames = 8
+    num_frames = 64
     video_asset = VideoAsset(name="baby_reading", num_frames=num_frames)
     video = video_asset.np_ndarrays
     metadata = video_asset.metadata
@@ -107,9 +107,9 @@ def run_gpu_test():
     # TEST 1: BASELINE - No Compression (Full Video at Once)
     # =========================================================================
     print("\n" + "=" * 100)
-    print("TEST 1: BASELINE - No Compression (Full 8 Frames)")
+    print("TEST 1: BASELINE - No Compression (Full 64 Frames)")
     print("=" * 100)
-    print("Processing all 8 frames in a single request without compression...")
+    print("Processing all 64 frames in a single request without compression...")
     
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
@@ -128,7 +128,7 @@ def run_gpu_test():
     
     start = time.perf_counter()
     output_baseline = llm_baseline.generate(
-        {"prompt": prompt, "multi_modal_data": {"video": make_video_chunks(8)}},
+        {"prompt": prompt, "multi_modal_data": {"video": make_video_chunks(64)}},
         sampling_params=sampling_params
     )
     baseline_duration = time.perf_counter() - start
@@ -156,7 +156,7 @@ def run_gpu_test():
     print("\n" + "=" * 100)
     print("TEST 2: STREAMING with Compression (Incremental Processing)")
     print("=" * 100)
-    print("Creating ONE LLM instance and processing frames incrementally (2→4→6→8)...")
+    print("Creating ONE LLM instance and processing frames incrementally ()...")
     print("Prefix caching should reuse KV cache from previous steps.\n")
     
     if torch.cuda.is_available():
@@ -187,7 +187,7 @@ def run_gpu_test():
     
     # Stream frames incrementally
     for step in range(1, 5):
-        num_frames_to_use = step * 2  # 2, 4, 6, 8 frames
+        num_frames_to_use = step * 16  # 4, 8, 12, 16 frames
         
         print(f"{'─' * 80}")
         print(f"Step {step}: Processing {num_frames_to_use} frames")
