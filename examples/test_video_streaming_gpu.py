@@ -174,9 +174,13 @@ def run_gpu_test():
         enforce_eager=True,           # Disable CUDA graphs (incompatible with compression)
         gpu_memory_utilization=0.90,
         limit_mm_per_prompt={"image": 10, "video": 10},
-        # Compression parameters (matching benchmark_compression.py working config)
-        kv_compression_num_sink_tokens=4,
-        kv_compression_num_recent_tokens=128,
+        # Compression parameters (tuned for 64 frames + prefix caching)
+        # We need to keep the history to hit the prefix cache!
+        # 128 tokens is too small (evicts everything).
+        # 64 frames * ~170 tokens = ~11k tokens.
+        # Set recent to 16384 to keep full history for this test.
+        kv_compression_num_sink_tokens=256,
+        kv_compression_num_recent_tokens=16384,
     )
     
     print("✅ Single LLM instance created with compression + prefix caching enabled.\n")
