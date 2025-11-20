@@ -79,12 +79,12 @@ def run_streaming_test(args):
     llm = LLM(
         model=args.model,
         # Context Limit:
-        # Since we use a Rolling Window (Sink + Recent), the input size is bounded (~14k tokens).
-        # We can safely use the model's native limit (32k) instead of 128k.
-        # This avoids the "sequence length > model length" warning.
-        max_model_len=32768,
+        # Your video seems to have high resolution (~800 tokens/frame).
+        # 48 frames exceeded 32k tokens.
+        # We increase limit to 64k to accommodate the rolling window safely.
+        max_model_len=65536,
         max_num_batched_tokens=32768,
-        enable_chunked_prefill=False, # Not needed for 32k context
+        enable_chunked_prefill=True, # Enable chunking for large updates
         enable_prefix_caching=True,
         enable_kv_compression=True,
         enforce_eager=True,
