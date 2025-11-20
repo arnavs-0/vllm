@@ -1104,6 +1104,25 @@ def unified_attention_with_output(
                 except:
                     pass
             
+            # Track actual sequence length by inferring from previous state
+            # CRITICAL FIX: Reset state when starting a NEW prefill (different video length)
+            # This happens when seq_len is available AND significantly different from tracked length
+            
+            if seq_len is not None:
+                # Check if this is a new prefill (seq_len available means we're in prefill phase)
+                if self.kv_compressor._actual_seq_len is None:
+                    # First time initialization
+                    self.kv_compressor._actual_seq_len = seq_len
+                    if layer_name == "language_model.layers.0.self_attn.attn":
+                        logger.info(f"Compression: Initializing seq_len={seq_len}")
+                elif abs(seq_len - self.kv_compressor._actual_seq_len) > 10:
+                    # seq_len differs significantly from tracked length
+                    # This means we're starting a NEW request with different video length
+                    # Reset compression state to avoid corruption
+                    self.kv_compressor._actual_seq_len = seq_len
+                    if layer_name == "language_model.layers.0.self_attn.attn":
+                        logger.info(f"Compression: NEW REQUEST detected, resetting seq_len={seq_len}")
+            
             if seq_len is not None and self.kv_compressor.should_compress(seq_len):
                 # Apply compression to KV cache
                 _, _, keep_mask, compression_info = self.kv_compressor.compress(

@@ -78,12 +78,13 @@ def run_streaming_test(args):
     # Configuration
     llm = LLM(
         model=args.model,
-        # Increase context limit to support VERY long videos.
-        # Qwen2-VL handles long context, and KV Compression keeps memory bounded.
-        # We set this high (128k) to avoid the "prompt too long" error.
-        max_model_len=128000,
-        max_num_batched_tokens=16384, # Limit batch size to avoid OOM
-        enable_chunked_prefill=True,  # Allow processing large prompts in chunks
+        # Context Limit:
+        # Since we use a Rolling Window (Sink + Recent), the input size is bounded (~14k tokens).
+        # We can safely use the model's native limit (32k) instead of 128k.
+        # This avoids the "sequence length > model length" warning.
+        max_model_len=32768,
+        max_num_batched_tokens=32768,
+        enable_chunked_prefill=False, # Not needed for 32k context
         enable_prefix_caching=True,
         enable_kv_compression=True,
         enforce_eager=True,
