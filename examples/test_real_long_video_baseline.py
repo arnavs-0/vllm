@@ -45,10 +45,10 @@ def run_baseline_test(args):
     # We need a large context to fit the whole video if it's long
     llm = LLM(
         model=args.model,
-        max_model_len=32768, # Adjust if video is longer
-        max_num_batched_tokens=32768,
+        max_model_len=args.max_model_len, 
+        max_num_batched_tokens=args.max_model_len,
         enforce_eager=True,
-        gpu_memory_utilization=0.90,
+        gpu_memory_utilization=0.98, # Give it all the memory we can
         limit_mm_per_prompt={"image": 10, "video": 10},
     )
     
@@ -105,6 +105,8 @@ if __name__ == "__main__":
     parser.add_argument("--video-path", type=str, required=True, help="Path to video file")
     parser.add_argument("--model", type=str, default="Qwen/Qwen2-VL-2B-Instruct")
     parser.add_argument("--max-frames", type=int, default=None, help="Max frames to process (optional)")
+    # Default to a huge context to attempt processing the full video
+    parser.add_argument("--max-model-len", type=int, default=500000, help="Max model context length")
     
     args = parser.parse_args()
     run_baseline_test(args)
