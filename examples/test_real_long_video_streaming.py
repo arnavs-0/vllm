@@ -91,8 +91,10 @@ def run_streaming_test(args):
         gpu_memory_utilization=0.90,
         limit_mm_per_prompt={"image": 10, "video": 10},
         # Large recent window to enable prefix caching for long context
-        kv_compression_num_sink_tokens=256,
-        kv_compression_num_recent_tokens=16384, 
+        # Aligning with window_size (approx 20 frames * 800 tokens = 16000 tokens)
+        # We increase sink tokens to cover the sink frames
+        kv_compression_num_sink_tokens=4096, # Covers ~4-5 frames
+        kv_compression_num_recent_tokens=20480, # Covers ~25 frames
     )
     
     sampling_params = SamplingParams(temperature=0.0, max_tokens=64)
@@ -116,7 +118,9 @@ def run_streaming_test(args):
     # We keep the first 'sink_size' frames (context anchor)
     # And the last 'window_size' frames (recent context)
     sink_size = 4
-    window_size = args.chunk_size * 4 # Keep last 4 chunks as context
+    # Align window_size with kv_compression limit to avoid massive eviction loops
+    # 20 frames * 800 tokens = 16000 tokens, which fits in 20480
+    window_size = 20
     
     print("\nStarting Stream...")
     print(f"Strategy: Rolling Window (Sink: {sink_size} frames, Window: {window_size} frames)")
