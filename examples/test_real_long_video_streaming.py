@@ -107,6 +107,8 @@ def run_streaming_test(args):
     
     # Streaming Loop
     history_frames = []
+    sink_frames = []
+    recent_frames = []
     step = 0
     total_time = 0
     
@@ -132,16 +134,23 @@ def run_streaming_test(args):
         if len(current_chunk) >= args.chunk_size:
             step += 1
             
-            # Add chunk to history
-            history_frames.extend(current_chunk)
-            current_chunk = [] # Reset chunk
-            
-            # Construct Input with Rolling Window
-            # 1. Sink Frames (Start of video)
-            if len(history_frames) > (sink_size + window_size):
-                input_frames = history_frames[:sink_size] + history_frames[-window_size:]
+            # Logic to manage rolling window without memory leak
+            if len(sink_frames) < sink_size:
+                sink_frames.extend(current_chunk)
+                # If we overshot sink_size, move excess to recent
+                if len(sink_frames) > sink_size:
+                    excess = sink_frames[sink_size:]
+                    sink_frames = sink_frames[:sink_size]
+                    recent_frames.extend(excess)
             else:
-                input_frames = history_frames
+                recent_frames.extend(current_chunk)
+            
+            # Prune recent frames to window size
+            if len(recent_frames) > window_size:
+                recent_frames = recent_frames[-window_size:]
+            
+            input_frames = sink_frames + recent_frames
+            current_chunk = [] # Reset chunk
             
             # vLLM expects numpy array for video
             video_input = np.array(input_frames)
