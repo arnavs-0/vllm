@@ -79,22 +79,20 @@ def run_streaming_test(args):
     llm = LLM(
         model=args.model,
         # Context Limit:
-        # Your video seems to have high resolution (~800 tokens/frame).
-        # 48 frames exceeded 32k tokens.
-        # We increase limit to 64k to accommodate the rolling window safely.
-        max_model_len=65536,
-        max_num_batched_tokens=65536, # Allow full batch processing
-        enable_chunked_prefill=False, # DISABLE chunking to avoid compression loops
+        # We increase limit to 128k to allow accumulating many frames before shifting.
+        # This enables Prefix Caching to work for most steps (Accumulate phase).
+        max_model_len=131072,
+        max_num_batched_tokens=131072, 
+        enable_chunked_prefill=False, 
         enable_prefix_caching=True,
         enable_kv_compression=True,
         enforce_eager=True,
         gpu_memory_utilization=0.90,
         limit_mm_per_prompt={"image": 10, "video": 10},
         # Large recent window to enable prefix caching for long context
-        # Aligning with window_size (approx 20 frames * 800 tokens = 16000 tokens)
-        # We increase sink tokens to cover the sink frames
-        kv_compression_num_sink_tokens=4096, # Covers ~4-5 frames
-        kv_compression_num_recent_tokens=20480, # Covers ~25 frames
+        # We allow up to ~100 frames (80k tokens) before eviction/shifting occurs
+        kv_compression_num_sink_tokens=4096, 
+        kv_compression_num_recent_tokens=96000, 
     )
     
     sampling_params = SamplingParams(temperature=0.0, max_tokens=64)
@@ -118,9 +116,9 @@ def run_streaming_test(args):
     # We keep the first 'sink_size' frames (context anchor)
     # And the last 'window_size' frames (recent context)
     sink_size = 4
-    # Align window_size with kv_compression limit to avoid massive eviction loops
-    # 20 frames * 800 tokens = 16000 tokens, which fits in 20480
-    window_size = 20
+    # Window size 100 frames allows accumulating ~6 chunks (if chunk=16) before shifting
+    # This gives 5 fast steps (cache hit) and 1 slow step (shift/recompute)
+    window_size = 100
     
     print("\nStarting Stream...")
     print(f"Strategy: Rolling Window (Sink: {sink_size} frames, Window: {window_size} frames)")
