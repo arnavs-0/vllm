@@ -1,3 +1,8 @@
+### This is for CSE 598 @ The University of Michigan
+### phase-1-2 branch implements Phase 1 (Logical Masking) & Phase 2 (Physical Block Eviction)
+### phase-3-hybrid-attention implements Phase 3 (Hybrid Attention)
+
+
 <!-- markdownlint-disable MD001 MD041 -->
 <p align="center">
   <picture>
