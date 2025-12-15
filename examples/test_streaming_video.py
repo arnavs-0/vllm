@@ -137,7 +137,8 @@ def test_streaming_video_multiple_batches():
             memories.append(mem_mb)
             print(f"  GPU Memory: {mem_mb:.1f} MB")
         
-        print(f"  Output: {outputs[0].outputs[0].text[:80]}...")
+    # Print full output for inspection (no truncation)
+    print(f"  Output: {outputs[0].outputs[0].text}")
     
     # Verify memory is stable (not growing unbounded)
     if memories:
