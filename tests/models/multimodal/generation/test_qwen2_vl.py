@@ -481,3 +481,23 @@ def test_qwen2_vl_video_embeddings_input(
         mm_limit=1,
         tensor_parallel_size=1,
     )
+
+
+def test_qwen2_vl_cuda_graph(vllm_runner, image_assets):
+    # This test is to verify the fix for the CUDA stream capture error.
+    # The error occurs when using CUDA graphs with FlashAttention,
+    # and the query tensor is not a multiple of 8.
+    model = "Qwen/Qwen2-VL-0.5B-Instruct"
+    dtype = "half"
+
+    with vllm_runner(model,
+                     dtype=dtype,
+                     enforce_eager=False,
+                     tensor_parallel_size=1) as llm:
+        prompt = IMAGE_PROMPTS[0]
+        image = image_assets[0].pil_image
+
+        output = llm.generate_greedy([prompt],
+                                     max_tokens=10,
+                                     images=[image])
+        assert output[0].outputs[0].text == "STOP"
